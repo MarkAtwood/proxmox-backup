@@ -191,7 +191,7 @@ impl IndexFile for FixedIndexReader {
     }
 
     fn compute_csum(&self) -> ([u8; 32], u64) {
-        let mut csum = openssl::sha::Sha256::new();
+        let mut csum = pbs_tools::sha::Sha256::new();
         let mut chunk_end = 0;
         for pos in 0..self.index_count() {
             let info = self.chunk_info(pos).unwrap();
@@ -465,7 +465,7 @@ impl FixedIndexWriter {
 
         let index_size = self.index_length * 32;
         let data = unsafe { std::slice::from_raw_parts(ptr.index().as_ptr(), index_size) };
-        let index_csum = openssl::sha::sha256(data);
+        let index_csum = pbs_tools::sha::sha256_digest(data);
 
         {
             let header = unsafe { ptr.header().as_mut() };

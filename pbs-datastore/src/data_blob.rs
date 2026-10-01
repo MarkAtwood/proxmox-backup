@@ -326,7 +326,7 @@ impl DataBlob {
 
     /// Compute the sha256 digest on the raw blob data
     pub fn csum(&self) -> [u8; 32] {
-        openssl::sha::sha256(&self.raw_data)
+        pbs_tools::sha::sha256_digest(&self.raw_data)
     }
 
     fn verify_digest(
@@ -336,7 +336,7 @@ impl DataBlob {
     ) -> Result<(), Error> {
         let digest = match config {
             Some(config) => config.compute_digest(data),
-            None => openssl::sha::sha256(data),
+            None => pbs_tools::sha::sha256_digest(data),
         };
         if &digest != expected_digest {
             bail!("detected chunk with wrong digest.");
@@ -515,7 +515,7 @@ impl<'a, 'b> DataChunkBuilder<'a, 'b> {
             if let Some(config) = self.config {
                 self.digest = config.compute_digest(self.orig_data);
             } else {
-                self.digest = openssl::sha::sha256(self.orig_data);
+                self.digest = pbs_tools::sha::sha256_digest(self.orig_data);
             }
             self.digest_computed = true;
         }

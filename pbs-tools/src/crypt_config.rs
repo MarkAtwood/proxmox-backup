@@ -77,7 +77,7 @@ impl CryptConfig {
     /// chunk digest values do not clash with values computed for
     /// other sectret keys.
     pub fn compute_digest(&self, data: &[u8]) -> [u8; 32] {
-        let mut hasher = openssl::sha::Sha256::new();
+        let mut hasher = crate::sha::Sha256::new();
         hasher.update(data);
         hasher.update(&self.id_key); // at the end, to avoid length extensions attacks
         hasher.finish()

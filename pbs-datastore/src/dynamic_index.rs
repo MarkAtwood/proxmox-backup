@@ -209,7 +209,7 @@ impl IndexFile for DynamicIndexReader {
     }
 
     fn compute_csum(&self) -> ([u8; 32], u64) {
-        let mut csum = openssl::sha::Sha256::new();
+        let mut csum = pbs_tools::sha::Sha256::new();
         let mut chunk_end = 0;
         for pos in 0..self.index_count() {
             let info = self.chunk_info(pos).unwrap();
@@ -272,7 +272,7 @@ pub struct DynamicIndexWriter {
     closed: bool,
     filename: PathBuf,
     tmp_filename: PathBuf,
-    csum: Option<openssl::sha::Sha256>,
+    csum: Option<pbs_tools::sha::Sha256>,
     pub uuid: [u8; 16],
     pub ctime: i64,
 }
@@ -310,7 +310,7 @@ impl DynamicIndexWriter {
         // header.index_csum = [0u8; 32];
         writer.write_all(header.as_bytes())?;
 
-        let csum = Some(openssl::sha::Sha256::new());
+        let csum = Some(pbs_tools::sha::Sha256::new());
 
         Ok(Self {
             writer,

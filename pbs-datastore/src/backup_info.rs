@@ -1217,7 +1217,7 @@ fn lock_file_path_helper(ns: &BackupNamespace, path: PathBuf) -> PathBuf {
 
     let first_eigthy = &enc[..80];
     let last_eighty = &enc[enc.len() - 80..];
-    let hash = hex::encode(openssl::sha::sha256(path_bytes));
+    let hash = hex::encode(pbs_tools::sha::sha256_digest(path_bytes));
 
     to_return.join(format!("{first_eigthy}...{last_eighty}-{hash}"))
 }

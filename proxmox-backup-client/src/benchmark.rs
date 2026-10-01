@@ -291,7 +291,7 @@ fn test_crypt_speed(benchmark_result: &mut BenchmarkResult) -> Result<(), Error>
 
     let mut bytes = 0;
     loop {
-        openssl::sha::sha256(&random_data);
+        pbs_tools::sha::sha256_digest(&random_data);
         bytes += random_data.len();
         if start_time.elapsed().as_micros() > 1_000_000 {
             break;

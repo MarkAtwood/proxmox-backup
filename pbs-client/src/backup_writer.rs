@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Error, bail, format_err};
 use futures::future::{self, AbortHandle, Either, FutureExt, TryFutureExt};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
-use openssl::sha::Sha256;
+use pbs_tools::sha::Sha256;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
@@ -222,7 +222,7 @@ impl BackupWriter {
         // fixme: avoid loading into memory
         reader.read_to_end(&mut raw_data)?;
 
-        let csum = openssl::sha::sha256(&raw_data);
+        let csum = pbs_tools::sha::sha256_digest(&raw_data);
         let param = json!({"encoded-size": raw_data.len(), "file-name": archive_name.as_ref() });
         let size = raw_data.len() as u64;
         let _value = self
@@ -261,7 +261,7 @@ impl BackupWriter {
         let raw_data = blob.into_inner();
         let size = raw_data.len() as u64;
 
-        let csum = openssl::sha::sha256(&raw_data);
+        let csum = pbs_tools::sha::sha256_digest(&raw_data);
         let param = json!({"encoded-size": size, "file-name": archive_name.as_ref() });
         let _value = self
             .h2
@@ -789,7 +789,7 @@ impl BackupWriter {
 
         let is_fixed_chunk_size = prefix == "fixed";
 
-        let index_csum = Arc::new(Mutex::new(Some(openssl::sha::Sha256::new())));
+        let index_csum = Arc::new(Mutex::new(Some(pbs_tools::sha::Sha256::new())));
         let index_csum_2 = index_csum.clone();
 
         let stream = stream
