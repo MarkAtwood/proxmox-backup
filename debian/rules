@@ -1,0 +1,86 @@
+#!/usr/bin/make -f
+# See debhelper(7) (uncomment to enable)
+# output every command that modifies files on the build system.
+DH_VERBOSE = 1
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/rustc/architecture.mk
+
+export BUILD_MODE=release
+export CARGO_STATIC_CONFIG=--config debian/cargo_home/config.static.toml
+
+# sync with Makefile!
+STATIC_TARGET_DIR := target/static-build
+ifeq ($(BUILD_MODE), release)
+STATIC_COMPILEDIR := $(STATIC_TARGET_DIR)/$(DEB_HOST_RUST_TYPE)/release
+else
+STATIC_COMPILEDIR := $(STATIC_TARGET_DIR)/$(DEB_HOST_RUST_TYPE)/debug
+endif
+# end sync with Makefile!
+
+export CARGO=/usr/share/cargo/bin/cargo
+
+export CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+export DEB_HOST_RUST_TYPE DEB_HOST_GNU_TYPE
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+
+export DEB_CARGO_CRATE=proxmox-backup_$(DEB_VERSION_UPSTREAM)
+export DEB_CARGO_PACKAGE=proxmox-backup
+
+ifneq ("$(wildcard .repoid)","")
+	export REPOID=$(shell cat .repoid)
+endif
+
+%:
+	dh $@ --with=bash-completion
+
+override_dh_auto_configure:
+	@perl -ne 'if (/^version\s*=\s*"(\d+(?:\.\d+)+)"/) { my $$v_cargo = $$1; my $$v_deb = "$(DEB_VERSION_UPSTREAM)"; \
+	    die "ERROR: d/changelog <-> Cargo.toml version mismatch: $$v_cargo != $$v_deb\n" if $$v_cargo ne $$v_deb; exit(0); }' Cargo.toml
+	$(CARGO) prepare-debian $(CURDIR)/debian/cargo_registry --link-from-system
+	# add a new config for static building, sync with Makefile!
+	cp debian/cargo_home/config.toml debian/cargo_home/config.static.toml
+	sed -ri -e 's!^(rustflags = .*)\]$$!\1, "-C", "target-feature=+crt-static", "-L", "$(STATIC_COMPILEDIR)/deps-stubs/"\]!' debian/cargo_home/config.static.toml
+	# `cargo build` and `cargo install` have different config precedence, symlink
+	# the wrapper config into a place where `build` picks it up as well..
+	# https://doc.rust-lang.org/cargo/commands/cargo-install.html#configuration-discovery
+	mkdir -p .cargo
+	ln -s $(CARGO_HOME)/config.toml $(CURDIR)/.cargo/config.toml
+	dh_auto_configure
+
+override_dh_auto_build:
+	dh_auto_build -- \
+	    PROXY_USER=backup \
+	    LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH)
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+override_dh_auto_install:
+	dh_auto_install -- \
+	    PROXY_USER=backup \
+	    LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH)
+	mkdir -p debian/proxmox-backup-client-static/usr/bin
+	mv debian/tmp/usr/bin/proxmox-backup-client-static debian/proxmox-backup-client-static/usr/bin/proxmox-backup-client
+	mv debian/tmp/usr/bin/pxar-static debian/proxmox-backup-client-static/usr/bin/pxar
+
+override_dh_installsystemd:
+	dh_installsystemd -pproxmox-backup-server  proxmox-backup-daily-update.timer
+	# note: we start/try-reload-restart services manually in postinst
+	dh_installsystemd --no-start --no-restart-after-upgrade --no-stop-on-upgrade
+
+override_dh_fixperms:
+	dh_fixperms --exclude sg-tape-cmd
+
+override_dh_strip:
+	dh_strip
+	for exe in $$(find \
+	    debian/proxmox-backup-client/usr \
+	    debian/proxmox-backup-server/usr \
+	    debian/proxmox-backup-file-restore \
+	    -executable -type f); do \
+	  debian/scripts/elf-strip-unused-dependencies.sh "$$exe" || true; \
+	done
+
+override_dh_compress:
+	dh_compress -X.pdf

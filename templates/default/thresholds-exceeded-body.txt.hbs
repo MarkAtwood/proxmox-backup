@@ -1,0 +1,13 @@
+Datastore '{{datastore}}' exceeded the configured {{threshold}} threshold.
+
+{{#if is-traffic}}
+Limit: {{human-bytes limit}}
+Value: {{human-bytes value}}
+{{else}}
+Limit: {{limit}}
+Value: {{value}}
+{{/if}}
+
+Please visit the web interface for further details:
+
+<{{base-url}}/#DataStore-{{datastore}}>

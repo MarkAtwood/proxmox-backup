@@ -1,0 +1,192 @@
+//! Tools and utilities
+//!
+//! This is a collection of small and useful tools.
+
+use anyhow::Error;
+use std::collections::HashSet;
+
+use pbs_api_types::{
+    Authid, BackupContent, CryptMode, MANIFEST_BLOB_NAME, Operation, SnapshotListItem,
+    SnapshotVerifyState,
+};
+use proxmox_http::{HttpOptions, ProxyConfig, client::Client};
+
+use pbs_datastore::DataStoreLookup;
+use pbs_datastore::backup_info::{BackupDir, BackupInfo};
+use pbs_datastore::manifest::BackupManifest;
+
+pub mod disks;
+pub mod fs;
+pub mod statistics;
+pub mod systemd;
+pub mod ticket;
+
+/// The default 2 hours are far too long for PBS
+pub const PROXMOX_BACKUP_TCP_KEEPALIVE_TIME: u32 = 120;
+pub const DEFAULT_USER_AGENT_STRING: &str = "proxmox-backup-client/1.0";
+
+/// Returns a new instance of [`Client`] configured for PBS usage.
+pub fn pbs_simple_http(proxy_config: Option<ProxyConfig>) -> Client {
+    let options = HttpOptions {
+        proxy_config,
+        user_agent: Some(DEFAULT_USER_AGENT_STRING.to_string()),
+        tcp_keepalive: Some(PROXMOX_BACKUP_TCP_KEEPALIVE_TIME),
+    };
+
+    Client::with_options(options)
+}
+
+pub fn setup_safe_path_env() {
+    std::env::set_var("PATH", "/sbin:/bin:/usr/sbin:/usr/bin");
+    // Make %ENV safer - as suggested by https://perldoc.perl.org/perlsec.html
+    for name in &["IFS", "CDPATH", "ENV", "BASH_ENV"] {
+        std::env::remove_var(name);
+    }
+}
+
+pub(crate) fn read_backup_index(
+    backup_dir: &BackupDir,
+) -> Result<Option<(BackupManifest, Vec<BackupContent>)>, Error> {
+    let (manifest, index_size) = match backup_dir.load_manifest() {
+        Ok((manifest, index_size)) => (manifest, index_size),
+        Err(err) => {
+            let mut manifest_path = backup_dir.full_path();
+            manifest_path.push(MANIFEST_BLOB_NAME.as_ref());
+            if !manifest_path.exists() {
+                return Ok(None);
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    let mut result = Vec::new();
+    for item in manifest.files() {
+        result.push(BackupContent {
+            filename: item.filename.to_string(),
+            crypt_mode: Some(item.crypt_mode),
+            size: Some(item.size),
+        });
+    }
+
+    result.push(BackupContent {
+        filename: MANIFEST_BLOB_NAME.to_string(),
+        crypt_mode: match manifest.signature {
+            Some(_) => Some(CryptMode::SignOnly),
+            None => Some(CryptMode::None),
+        },
+        size: Some(index_size),
+    });
+
+    Ok(Some((manifest, result)))
+}
+
+pub(crate) fn get_all_snapshot_files(
+    info: &BackupInfo,
+) -> Result<Option<(BackupManifest, Vec<BackupContent>)>, Error> {
+    let Some((manifest, mut files)) = read_backup_index(&info.backup_dir)? else {
+        return Ok(None);
+    };
+
+    let file_set = files.iter().fold(HashSet::new(), |mut acc, item| {
+        acc.insert(item.filename.clone());
+        acc
+    });
+
+    for file in &info.files {
+        if file_set.contains(file) {
+            continue;
+        }
+        files.push(BackupContent {
+            filename: file.to_string(),
+            size: None,
+            crypt_mode: None,
+        });
+    }
+
+    Ok(Some((manifest, files)))
+}
+
+/// Helper to transform `BackupInfo` to `SnapshotListItem` with given owner.
+pub(crate) fn backup_info_to_snapshot_list_item(
+    info: &BackupInfo,
+    owner: &Authid,
+) -> SnapshotListItem {
+    let backup = info.backup_dir.dir().to_owned();
+    let protected = info.protected;
+    let owner = Some(owner.to_owned());
+
+    match get_all_snapshot_files(info) {
+        Ok(Some((manifest, files))) => {
+            // extract the first line from notes
+            let comment: Option<String> = manifest.unprotected["notes"]
+                .as_str()
+                .and_then(|notes| notes.lines().next())
+                .map(String::from);
+
+            let fingerprint = match manifest.fingerprint() {
+                Ok(fp) => fp,
+                Err(err) => {
+                    eprintln!("error parsing fingerprint: '{err}'");
+                    None
+                }
+            };
+
+            let verification: Option<SnapshotVerifyState> = match manifest.verify_state() {
+                Ok(verify) => verify,
+                Err(err) => {
+                    eprintln!("error parsing verification state : '{err}'");
+                    None
+                }
+            };
+
+            let size = Some(files.iter().map(|x| x.size.unwrap_or(0)).sum());
+
+            return SnapshotListItem {
+                backup,
+                comment,
+                verification,
+                fingerprint,
+                files,
+                size,
+                owner,
+                protected,
+            };
+        }
+        Ok(None) => (),
+        Err(err) => eprintln!("error during snapshot file listing: '{err}'"),
+    }
+
+    // no manifest (possibly ongoing backup) or manifest read error,
+    // fallback to listing without any additional metadata.
+    let files = info
+        .files
+        .iter()
+        .map(|filename| BackupContent {
+            filename: filename.to_owned(),
+            size: None,
+            crypt_mode: None,
+        })
+        .collect();
+
+    SnapshotListItem {
+        backup,
+        comment: None,
+        verification: None,
+        fingerprint: None,
+        files,
+        size: None,
+        owner,
+        protected,
+    }
+}
+
+/// Lookup the datastore by name with given operation.
+#[inline(always)]
+pub fn lookup_with<'a>(name: &'a str, operation: Operation) -> DataStoreLookup<'a> {
+    DataStoreLookup::with(
+        name,
+        operation,
+        Some(crate::server::notifications::send_datastore_threshold_exceeded),
+    )
+}

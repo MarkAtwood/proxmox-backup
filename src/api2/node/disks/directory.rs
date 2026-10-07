@@ -1,0 +1,376 @@
+use std::sync::LazyLock;
+
+use ::serde::{Deserialize, Serialize};
+use anyhow::{Error, bail};
+use serde_json::json;
+use std::os::linux::fs::MetadataExt;
+use tracing::info;
+
+use proxmox_router::{Permission, Router, RpcEnvironment, RpcEnvironmentType};
+use proxmox_schema::api;
+use proxmox_section_config::SectionConfigData;
+
+use pbs_api_types::{
+    BLOCKDEVICE_NAME_SCHEMA, DATASTORE_MOUNT_DIR, DATASTORE_SCHEMA, DataStoreConfig, NODE_SCHEMA,
+    PRIV_SYS_AUDIT, PRIV_SYS_MODIFY, UPID_SCHEMA,
+};
+
+use crate::tools::disks::{
+    DiskManage, DiskUsageQuery, DiskUsageType, FileSystemType, create_file_system,
+    create_single_linux_partition, get_fs_uuid,
+};
+use crate::tools::systemd::{self, types::*};
+
+use proxmox_rest_server::WorkerTask;
+
+#[api(
+    properties: {
+        "filesystem": {
+            type: FileSystemType,
+            optional: true,
+        },
+    },
+)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+/// Datastore mount info.
+pub struct DatastoreMountInfo {
+    /// The path of the mount unit.
+    pub unitfile: String,
+    /// The name of the mount
+    pub name: String,
+    /// The mount path.
+    pub path: String,
+    /// The mounted device.
+    pub device: String,
+    /// This is removable
+    pub removable: bool,
+    /// File system type
+    pub filesystem: Option<String>,
+    /// Mount options
+    pub options: Option<String>,
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+        }
+    },
+    returns: {
+        description: "List of removable-datastore devices and systemd datastore mount units.",
+        type: Array,
+        items: {
+            type: DatastoreMountInfo,
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["system", "disks"], PRIV_SYS_AUDIT, false),
+    },
+)]
+/// List systemd datastore mount units.
+pub fn list_datastore_mounts() -> Result<Vec<DatastoreMountInfo>, Error> {
+    static MOUNT_NAME_REGEX: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^mnt-datastore-(.+)\.mount$").unwrap());
+
+    let mut list = Vec::new();
+
+    let basedir = "/etc/systemd/system";
+    for item in proxmox_sys::fs::scan_subdir(libc::AT_FDCWD, basedir, &MOUNT_NAME_REGEX)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().to_string();
+
+        let unitfile = format!("{basedir}/{name}");
+        let config = systemd::config::parse_systemd_mount(&unitfile)?;
+        let data: SystemdMountSection = config.lookup("Mount", "Mount")?;
+
+        let name = data
+            .Where
+            .strip_prefix(DATASTORE_MOUNT_DIR)
+            .unwrap_or(&data.Where)
+            .to_string();
+
+        list.push(DatastoreMountInfo {
+            unitfile,
+            name,
+            device: data.What,
+            path: data.Where,
+            filesystem: data.Type,
+            options: data.Options,
+            removable: false,
+        });
+    }
+
+    let (config, _digest) = pbs_config::datastore::config()?;
+    let store_list: Vec<DataStoreConfig> = config.convert_to_typed_array("datastore")?;
+
+    for item in store_list
+        .into_iter()
+        .filter(|store| store.backing_device.is_some())
+    {
+        let Some(backing_device) = item.backing_device.as_deref() else {
+            continue;
+        };
+        list.push(DatastoreMountInfo {
+            unitfile: "datastore config".to_string(),
+            name: item.name.clone(),
+            device: format!("/dev/disk/by-uuid/{backing_device}"),
+            path: item.absolute_path(),
+            filesystem: None,
+            options: None,
+            removable: true,
+        });
+    }
+
+    Ok(list)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+            name: {
+                schema: DATASTORE_SCHEMA,
+            },
+            disk: {
+                schema: BLOCKDEVICE_NAME_SCHEMA,
+            },
+            "add-datastore": {
+                description: "Configure a datastore using the directory.",
+                type: bool,
+                optional: true,
+                default: false,
+            },
+            "removable-datastore": {
+                description: "The added datastore is removable.",
+                type: bool,
+                optional: true,
+                default: false,
+            },
+            filesystem: {
+                type: FileSystemType,
+                optional: true,
+            },
+         }
+    },
+    returns: {
+        schema: UPID_SCHEMA,
+    },
+    access: {
+        permission: &Permission::Privilege(&["system", "disks"], PRIV_SYS_MODIFY, false),
+    },
+)]
+/// Create a Filesystem on an unused disk. Will be mounted under `/mnt/datastore/<name>`.
+pub fn create_datastore_disk(
+    name: String,
+    disk: String,
+    add_datastore: bool,
+    removable_datastore: bool,
+    filesystem: Option<FileSystemType>,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<String, Error> {
+    let to_stdout = rpcenv.env_type() == RpcEnvironmentType::CLI;
+
+    let auth_id = rpcenv.get_auth_id().unwrap();
+
+    let info = DiskUsageQuery::new().smart(false).find(&disk)?;
+
+    if info.used != DiskUsageType::Unused {
+        bail!("disk '{}' is already in use.", disk);
+    }
+
+    let mount_point = format!("{}/{}", DATASTORE_MOUNT_DIR, &name);
+    // check if the default path exists already.
+    // bail if it is not empty or another filesystem mounted on top
+    let default_path = std::path::PathBuf::from(&mount_point);
+
+    match std::fs::metadata(&default_path) {
+        Err(_) => {} // path does not exist
+        Ok(stat) => {
+            let basedir_dev = std::fs::metadata(DATASTORE_MOUNT_DIR)?.st_dev();
+            if stat.st_dev() != basedir_dev {
+                bail!("path {default_path:?} already exists and is mountpoint");
+            }
+            let is_empty = default_path.read_dir()?.next().is_none();
+            if !is_empty {
+                bail!("path {default_path:?} already exists and is not empty");
+            }
+        }
+    }
+
+    let (mount_unit_path, _) = datastore_mount_unit_path_info(&mount_point);
+    if std::path::PathBuf::from(&mount_unit_path).exists() {
+        bail!("systemd mount unit '{mount_unit_path}' already exists");
+    }
+
+    let upid_str = WorkerTask::new_thread(
+        "dircreate",
+        Some(name.clone()),
+        auth_id,
+        to_stdout,
+        move |_worker| {
+            info!("create datastore '{name}' on disk {disk}");
+
+            let filesystem = filesystem.unwrap_or(FileSystemType::Ext4);
+
+            let manager = DiskManage::new();
+
+            let disk = manager.disk_by_name(&disk)?;
+
+            let partition = create_single_linux_partition(&disk)?;
+            create_file_system(&partition, filesystem)?;
+
+            let uuid = get_fs_uuid(&partition)?;
+            let uuid_path = format!("/dev/disk/by-uuid/{uuid}");
+
+            if !removable_datastore {
+                let mount_unit_name =
+                    create_datastore_mount_unit(&name, &mount_point, filesystem, &uuid_path)?;
+
+                crate::tools::systemd::reload_daemon()?;
+                crate::tools::systemd::enable_unit(&mount_unit_name)?;
+                crate::tools::systemd::start_unit(&mount_unit_name)?;
+            }
+
+            if add_datastore {
+                let lock = pbs_config::datastore::lock_config()?;
+                let datastore: DataStoreConfig = if removable_datastore {
+                    serde_json::from_value(
+                        json!({ "name": name, "path": name, "backing-device": uuid }),
+                    )?
+                } else {
+                    serde_json::from_value(json!({ "name": name, "path": mount_point }))?
+                };
+                let (config, _digest) = pbs_config::datastore::config()?;
+
+                if config.sections.contains_key(&datastore.name) {
+                    bail!("datastore '{}' already exists.", datastore.name);
+                }
+
+                crate::api2::config::datastore::do_create_datastore(
+                    lock, config, datastore, false, false,
+                )?;
+            }
+
+            Ok(())
+        },
+    )?;
+
+    Ok(upid_str)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            node: {
+                schema: NODE_SCHEMA,
+            },
+            name: {
+                schema: DATASTORE_SCHEMA,
+            },
+        }
+    },
+    access: {
+        permission: &Permission::Privilege(&["system", "disks"], PRIV_SYS_MODIFY, false),
+    },
+)]
+/// Remove a Filesystem mounted under `/mnt/datastore/<name>`.
+pub fn delete_datastore_disk(name: String) -> Result<(), Error> {
+    let path = format!("{DATASTORE_MOUNT_DIR}/{name}");
+    // path of datastore cannot be changed
+    let (config, _) = pbs_config::datastore::config()?;
+    let datastores: Vec<DataStoreConfig> = config.convert_to_typed_array("datastore")?;
+    let conflicting_datastore: Option<DataStoreConfig> =
+        datastores.into_iter().find(|ds| ds.absolute_path() == path);
+
+    if let Some(conflicting_datastore) = conflicting_datastore {
+        bail!(
+            "Can't remove '{}' since it's required by datastore '{}'",
+            conflicting_datastore.absolute_path(),
+            conflicting_datastore.name
+        );
+    }
+
+    // disable systemd mount-unit
+    let mut mount_unit_name = proxmox_systemd::escape_unit(&path, true);
+    mount_unit_name.push_str(".mount");
+    crate::tools::systemd::disable_unit(&mount_unit_name)?;
+
+    // delete .mount-file
+    let mount_unit_path = format!("/etc/systemd/system/{mount_unit_name}");
+    let full_path = std::path::Path::new(&mount_unit_path);
+    log::info!("removing systemd mount unit {:?}", full_path);
+    std::fs::remove_file(full_path)?;
+
+    // try to unmount, if that fails tell the user to reboot or unmount manually
+    let mut command = std::process::Command::new("umount");
+    command.arg(&path);
+    match proxmox_sys::command::run_command(command, None) {
+        Err(_) => bail!(
+            "Could not umount '{}' since it is busy. It will stay mounted \
+             until the next reboot or until unmounted manually!",
+            path
+        ),
+        Ok(_) => Ok(()),
+    }
+}
+
+const ITEM_ROUTER: Router = Router::new().delete(&API_METHOD_DELETE_DATASTORE_DISK);
+
+pub const ROUTER: Router = Router::new()
+    .get(&API_METHOD_LIST_DATASTORE_MOUNTS)
+    .post(&API_METHOD_CREATE_DATASTORE_DISK)
+    .match_all("name", &ITEM_ROUTER);
+
+fn datastore_mount_unit_path_info(mount_point: &str) -> (String, String) {
+    let mut mount_unit_name = proxmox_systemd::escape_unit(mount_point, true);
+    mount_unit_name.push_str(".mount");
+
+    (
+        format!("/etc/systemd/system/{mount_unit_name}"),
+        mount_unit_name,
+    )
+}
+
+fn create_datastore_mount_unit(
+    datastore_name: &str,
+    mount_point: &str,
+    fs_type: FileSystemType,
+    what: &str,
+) -> Result<String, Error> {
+    let (mount_unit_path, mount_unit_name) = datastore_mount_unit_path_info(mount_point);
+
+    let unit = SystemdUnitSection {
+        Description: format!("Mount datatstore '{datastore_name}' under '{mount_point}'"),
+        ..Default::default()
+    };
+
+    let install = SystemdInstallSection {
+        WantedBy: Some(vec!["multi-user.target".to_string()]),
+        ..Default::default()
+    };
+
+    let mount = SystemdMountSection {
+        What: what.to_string(),
+        Where: mount_point.to_string(),
+        Type: Some(fs_type.to_string()),
+        Options: Some(String::from("defaults")),
+        ..Default::default()
+    };
+
+    let mut config = SectionConfigData::new();
+    config.set_data("Unit", "Unit", unit)?;
+    config.set_data("Install", "Install", install)?;
+    config.set_data("Mount", "Mount", mount)?;
+
+    systemd::config::save_systemd_mount(&mount_unit_path, &config)?;
+
+    Ok(mount_unit_name)
+}

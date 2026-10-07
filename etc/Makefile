@@ -1,0 +1,25 @@
+include ../defines.mk
+
+UNITS := \
+	pbs-network-config-commit.service \
+	proxmox-backup-daily-update.timer \
+	removable-device-attach@.service
+
+DYNAMIC_UNITS := \
+	proxmox-backup-banner.service \
+	proxmox-backup-daily-update.service \
+	proxmox-backup.service \
+	proxmox-backup-proxy.service
+
+all: $(UNITS) $(DYNAMIC_UNITS) pbs-enterprise.sources
+
+clean:
+	rm -f $(DYNAMIC_UNITS)
+
+.SUFFIXES: .service.in .service
+.service.in.service:
+	sed \
+	    -e 's!%LIBEXECDIR%!$(LIBEXECDIR)!g' \
+	    -e 's!%PROXY_USER%!$(PROXY_USER)!g' \
+	    $< >$@.tmp
+	mv $@.tmp $@

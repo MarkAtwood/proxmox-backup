@@ -1,0 +1,967 @@
+use anyhow::{Context, Error, bail, format_err};
+use pbs_config::BackupLockGuard;
+use proxmox_sys::process_locker::ProcessLockSharedGuard;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tracing::info;
+
+use ::serde::Serialize;
+use serde_json::{Value, json};
+
+use proxmox_http::Body;
+use proxmox_router::{RpcEnvironment, RpcEnvironmentType};
+
+use pbs_api_types::{Authid, BackupArchiveName, MANIFEST_BLOB_NAME};
+use pbs_datastore::backup_info::{BackupDir, BackupInfo};
+use pbs_datastore::dynamic_index::DynamicIndexWriter;
+use pbs_datastore::fixed_index::FixedIndexWriter;
+use pbs_datastore::{BackupManifest, DataBlob, DataStore, DatastoreBackend};
+use proxmox_rest_server::{WorkerTask, formatter::*};
+
+use crate::backup::VerifyWorker;
+
+use hyper::Response;
+
+#[derive(Copy, Clone, Serialize)]
+struct UploadStatistic {
+    count: u64,
+    size: u64,
+    compressed_size: u64,
+    duplicates: u64,
+}
+
+impl UploadStatistic {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            size: 0,
+            compressed_size: 0,
+            duplicates: 0,
+        }
+    }
+}
+
+impl std::ops::Add for UploadStatistic {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            count: self.count + other.count,
+            size: self.size + other.size,
+            compressed_size: self.compressed_size + other.compressed_size,
+            duplicates: self.duplicates + other.duplicates,
+        }
+    }
+}
+
+struct DynamicWriterState {
+    name: BackupArchiveName,
+    index: DynamicIndexWriter,
+    offset: u64,
+    chunk_count: u64,
+    upload_stat: UploadStatistic,
+    closed: bool,
+}
+
+struct FixedWriterState {
+    name: BackupArchiveName,
+    index: FixedIndexWriter,
+    size: Option<u64>,
+    chunk_size: u32,
+    chunk_count: u64,
+    small_chunk_count: usize, // allow 0..1 small chunks (last chunk may be smaller)
+    upload_stat: UploadStatistic,
+    incremental: bool,
+    closed: bool,
+}
+
+// key=digest, value=length
+type KnownChunksMap = HashMap<[u8; 32], u32>;
+
+#[derive(PartialEq)]
+enum BackupState {
+    Active,
+    Finishing,
+    Finished,
+}
+
+struct SharedBackupState {
+    finished: BackupState,
+    uid_counter: usize,
+    file_counter: usize, // successfully uploaded files
+    dynamic_writers: HashMap<usize, DynamicWriterState>,
+    fixed_writers: HashMap<usize, FixedWriterState>,
+    known_chunks: KnownChunksMap,
+    backup_size: u64, // sums up size of all files
+    backup_stat: UploadStatistic,
+    backup_lock_guards: BackupLockGuards,
+    manifest: Option<BackupManifest>,
+    uploaded_archives: HashMap<String, [u8; 32]>,
+}
+
+pub struct BackupLockGuards {
+    previous_snapshot: Option<BackupLockGuard>,
+    group: Option<BackupLockGuard>,
+    snapshot: Option<BackupLockGuard>,
+    chunk_store: Option<ProcessLockSharedGuard>,
+}
+
+impl BackupLockGuards {
+    pub(crate) fn new(
+        previous_snapshot: Option<BackupLockGuard>,
+        group: BackupLockGuard,
+        snapshot: BackupLockGuard,
+        chunk_store: ProcessLockSharedGuard,
+    ) -> Self {
+        Self {
+            previous_snapshot,
+            group: Some(group),
+            snapshot: Some(snapshot),
+            chunk_store: Some(chunk_store),
+        }
+    }
+}
+
+impl SharedBackupState {
+    // Raise error if the backup is no longer in an active state.
+    fn ensure_unfinished(&self) -> Result<(), Error> {
+        match self.finished {
+            BackupState::Active => Ok(()),
+            BackupState::Finishing => bail!("backup is already in the process of finishing."),
+            BackupState::Finished => bail!("backup already marked as finished."),
+        }
+    }
+
+    // Get an unique integer ID
+    pub fn next_uid(&mut self) -> usize {
+        self.uid_counter += 1;
+        self.uid_counter
+    }
+}
+
+/// `RpcEnvironment` implementation for backup service
+#[derive(Clone)]
+pub struct BackupEnvironment {
+    env_type: RpcEnvironmentType,
+    result_attributes: Value,
+    auth_id: Authid,
+    pub debug: bool,
+    pub no_cache: bool,
+    pub formatter: &'static dyn OutputFormatter,
+    pub worker: Arc<WorkerTask>,
+    pub datastore: Arc<DataStore>,
+    pub backup_dir: BackupDir,
+    pub last_backup: Option<BackupInfo>,
+    pub backend: DatastoreBackend,
+    state: Arc<Mutex<SharedBackupState>>,
+}
+
+impl BackupEnvironment {
+    pub fn new(
+        env_type: RpcEnvironmentType,
+        auth_id: Authid,
+        worker: Arc<WorkerTask>,
+        datastore: Arc<DataStore>,
+        backup_dir: BackupDir,
+        no_cache: bool,
+        backup_lock_guards: BackupLockGuards,
+    ) -> Result<Self, Error> {
+        let state = SharedBackupState {
+            finished: BackupState::Active,
+            uid_counter: 0,
+            file_counter: 0,
+            dynamic_writers: HashMap::new(),
+            fixed_writers: HashMap::new(),
+            known_chunks: HashMap::new(),
+            backup_size: 0,
+            backup_stat: UploadStatistic::new(),
+            backup_lock_guards,
+            manifest: None,
+            uploaded_archives: HashMap::new(),
+        };
+
+        let backend = datastore.backend()?;
+        Ok(Self {
+            result_attributes: json!({}),
+            env_type,
+            auth_id,
+            worker,
+            datastore,
+            debug: tracing::enabled!(tracing::Level::DEBUG),
+            no_cache,
+            formatter: JSON_FORMATTER,
+            backup_dir,
+            last_backup: None,
+            backend,
+            state: Arc::new(Mutex::new(state)),
+        })
+    }
+
+    /// Register a Chunk with associated length.
+    ///
+    /// We do not fully trust clients, so a client may only use registered
+    /// chunks. Please use this method to register chunks from previous backups.
+    pub fn register_chunk(&self, digest: [u8; 32], length: u32) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        state.known_chunks.insert(digest, length);
+
+        Ok(())
+    }
+
+    /// Register fixed length chunks after upload.
+    ///
+    /// Like `register_chunk()`, but additionally record statistics for
+    /// the fixed index writer.
+    pub fn register_fixed_chunk(
+        &self,
+        wid: usize,
+        digest: [u8; 32],
+        size: u32,
+        compressed_size: u32,
+        is_duplicate: bool,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.fixed_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("fixed writer '{}' not registered", wid),
+        };
+
+        if data.closed {
+            bail!(
+                "fixed writer '{}' register chunk failed - already closed",
+                data.name
+            );
+        }
+
+        if size > data.chunk_size {
+            bail!(
+                "fixed writer '{}' - got large chunk ({} > {}",
+                data.name,
+                size,
+                data.chunk_size
+            );
+        }
+
+        if size < data.chunk_size {
+            data.small_chunk_count += 1;
+            if data.small_chunk_count > 1 {
+                bail!(
+                    "fixed writer '{}' - detected multiple end chunks (chunk size too small)",
+                    wid
+                );
+            }
+        }
+
+        // record statistics
+        data.upload_stat.count += 1;
+        data.upload_stat.size += size as u64;
+        data.upload_stat.compressed_size += compressed_size as u64;
+        if is_duplicate {
+            data.upload_stat.duplicates += 1;
+        }
+
+        // register chunk
+        state.known_chunks.insert(digest, size);
+
+        Ok(())
+    }
+
+    /// Register dynamic length chunks after upload.
+    ///
+    /// Like `register_chunk()`, but additionally record statistics for
+    /// the dynamic index writer.
+    pub fn register_dynamic_chunk(
+        &self,
+        wid: usize,
+        digest: [u8; 32],
+        size: u32,
+        compressed_size: u32,
+        is_duplicate: bool,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.dynamic_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("dynamic writer '{}' not registered", wid),
+        };
+
+        if data.closed {
+            bail!(
+                "dynamic writer '{}' register chunk failed - already closed",
+                data.name
+            );
+        }
+
+        // record statistics
+        data.upload_stat.count += 1;
+        data.upload_stat.size += size as u64;
+        data.upload_stat.compressed_size += compressed_size as u64;
+        if is_duplicate {
+            data.upload_stat.duplicates += 1;
+        }
+
+        // register chunk
+        state.known_chunks.insert(digest, size);
+
+        Ok(())
+    }
+
+    pub fn lookup_chunk(&self, digest: &[u8; 32]) -> Option<u32> {
+        let state = self.state.lock().unwrap();
+
+        state.known_chunks.get(digest).copied()
+    }
+
+    /// Store the writer with an unique ID
+    pub fn register_dynamic_writer(
+        &self,
+        index: DynamicIndexWriter,
+        name: BackupArchiveName,
+    ) -> Result<usize, Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let uid = state.next_uid();
+
+        state.dynamic_writers.insert(
+            uid,
+            DynamicWriterState {
+                index,
+                name,
+                offset: 0,
+                chunk_count: 0,
+                upload_stat: UploadStatistic::new(),
+                closed: false,
+            },
+        );
+
+        Ok(uid)
+    }
+
+    /// Store the writer with an unique ID
+    pub fn register_fixed_writer(
+        &self,
+        index: FixedIndexWriter,
+        name: BackupArchiveName,
+        size: Option<u64>,
+        chunk_size: u32,
+        incremental: bool,
+    ) -> Result<usize, Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let uid = state.next_uid();
+
+        state.fixed_writers.insert(
+            uid,
+            FixedWriterState {
+                index,
+                name,
+                chunk_count: 0,
+                size,
+                chunk_size,
+                small_chunk_count: 0,
+                upload_stat: UploadStatistic::new(),
+                incremental,
+                closed: false,
+            },
+        );
+
+        Ok(uid)
+    }
+
+    /// Register a manifest associated with the backup snapshot for given backup session.
+    ///
+    /// Do not fully trust clients, verify the manifest consistency on backup finish.
+    /// FIXME: PBS 5: do not allow for multiple manifest uploads.
+    pub fn register_manifest(&self, manifest: BackupManifest) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        state.manifest = Some(manifest);
+
+        Ok(())
+    }
+
+    /// Append chunk to dynamic writer
+    pub fn dynamic_writer_append_chunk(
+        &self,
+        wid: usize,
+        offset: u64,
+        size: u32,
+        digest: &[u8; 32],
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.dynamic_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("dynamic writer '{}' not registered", wid),
+        };
+
+        if data.closed {
+            bail!(
+                "dynamic writer '{}' append chunk failed - already closed",
+                data.name
+            );
+        }
+
+        if data.offset != offset {
+            bail!(
+                "dynamic writer '{}' append chunk failed - got strange chunk offset ({} != {})",
+                data.name,
+                data.offset,
+                offset
+            );
+        }
+
+        data.offset += size as u64;
+        data.chunk_count += 1;
+
+        data.index.add_chunk(data.offset, digest)?;
+
+        Ok(())
+    }
+
+    /// Append chunk to fixed writer
+    pub fn fixed_writer_append_chunk(
+        &self,
+        wid: usize,
+        offset: u64,
+        size: u32,
+        digest: &[u8; 32],
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.fixed_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("fixed writer '{}' not registered", wid),
+        };
+
+        if data.closed {
+            bail!(
+                "fixed writer '{}' append chunk failed - already closed",
+                data.name
+            );
+        }
+
+        data.index.add_chunk(offset, size, digest)?;
+
+        data.chunk_count += 1;
+
+        Ok(())
+    }
+
+    fn log_upload_stat(
+        &self,
+        archive_name: &BackupArchiveName,
+        csum: &[u8; 32],
+        uuid: &[u8; 16],
+        size: u64,
+        chunk_count: u64,
+        upload_stat: &UploadStatistic,
+    ) {
+        self.log(format!("Upload statistics for '{archive_name}'"));
+        self.log(format!("UUID: {}", hex::encode(uuid)));
+        self.log(format!("Checksum: {}", hex::encode(csum)));
+        self.log(format!("Size: {size}"));
+        self.log(format!("Chunk count: {chunk_count}"));
+
+        if size == 0 || chunk_count == 0 {
+            return;
+        }
+
+        self.log(format!(
+            "Upload size: {} ({}%)",
+            upload_stat.size,
+            (upload_stat.size * 100) / size
+        ));
+
+        // account for zero chunk, which might be uploaded but never used
+        let client_side_duplicates = chunk_count.saturating_sub(upload_stat.count);
+
+        let server_side_duplicates = upload_stat.duplicates;
+
+        if (client_side_duplicates + server_side_duplicates) > 0 {
+            let per = (client_side_duplicates + server_side_duplicates) * 100 / chunk_count;
+            self.log(format!(
+                "Duplicates: {client_side_duplicates}+{server_side_duplicates} ({per}%)"
+            ));
+        }
+
+        if let Some(c) = (upload_stat.compressed_size * 100).checked_div(upload_stat.size) {
+            self.log(format!("Compression: {c}%"));
+        }
+    }
+
+    /// Close dynamic writer
+    pub fn dynamic_writer_close(
+        &self,
+        wid: usize,
+        chunk_count: u64,
+        size: u64,
+        csum: [u8; 32],
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.dynamic_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("dynamic writer '{}' not registered", wid),
+        };
+        let writer_name = data.name.clone();
+        let uuid = data.index.uuid;
+        let upload_stat = data.upload_stat;
+
+        if data.closed {
+            bail!("dynamic writer '{writer_name}' close failed - already closed");
+        }
+
+        if data.chunk_count != chunk_count {
+            bail!(
+                "dynamic writer '{}' close failed - unexpected chunk count ({} != {})",
+                data.name,
+                data.chunk_count,
+                chunk_count
+            );
+        }
+
+        if data.offset != size {
+            bail!(
+                "dynamic writer '{}' close failed - unexpected file size ({} != {})",
+                data.name,
+                data.offset,
+                size
+            );
+        }
+
+        let expected_csum = data.index.close()?;
+        data.closed = true;
+
+        if csum != expected_csum {
+            bail!(
+                "dynamic writer '{}' close failed - got unexpected checksum",
+                data.name
+            );
+        }
+
+        state
+            .uploaded_archives
+            .insert(writer_name.to_string(), csum);
+        state.file_counter += 1;
+        state.backup_size += size;
+        state.backup_stat = state.backup_stat + upload_stat;
+
+        self.log_upload_stat(&writer_name, &csum, &uuid, size, chunk_count, &upload_stat);
+
+        // never hold mutex guard during s3 upload due to possible deadlocks
+        drop(state);
+
+        // For S3 backends, upload the index file to the object store after closing
+        if proxmox_async::runtime::block_on(
+            self.backend
+                .upload_index_to_backend(&self.backup_dir, writer_name.as_ref()),
+        )
+        .context("failed to upload dynamic index to backend")?
+        {
+            self.log(format!(
+                "Uploaded dynamic index file to backend: {writer_name}"
+            ))
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.dynamic_writers.remove(&wid).is_none() {
+            bail!("dynamic writer '{wid}' no longer registered");
+        }
+
+        Ok(())
+    }
+
+    /// Close fixed writer
+    pub fn fixed_writer_close(
+        &self,
+        wid: usize,
+        chunk_count: u64,
+        size: u64,
+        csum: [u8; 32],
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        let data = match state.fixed_writers.get_mut(&wid) {
+            Some(data) => data,
+            None => bail!("fixed writer '{}' not registered", wid),
+        };
+
+        let writer_name = data.name.clone();
+        let uuid = data.index.uuid;
+        let upload_stat = data.upload_stat;
+
+        if data.closed {
+            bail!("fixed writer '{writer_name}' close failed - already closed");
+        }
+
+        if data.chunk_count != chunk_count {
+            bail!(
+                "fixed writer '{}' close failed - received wrong number of chunk ({} != {})",
+                data.name,
+                data.chunk_count,
+                chunk_count
+            );
+        }
+
+        if data.incremental && data.size.is_none() {
+            data.index.grow_to_size(size)?;
+        }
+
+        if !data.incremental {
+            let expected_count = data.index.index_length();
+
+            if chunk_count != (expected_count as u64) {
+                bail!(
+                    "fixed writer '{}' close failed - unexpected chunk count ({} != {})",
+                    data.name,
+                    expected_count,
+                    chunk_count
+                );
+            }
+
+            if let Some(known_size) = data.size {
+                if size != known_size {
+                    bail!(
+                        "fixed writer '{}' close failed - unexpected file size ({} != {})",
+                        data.name,
+                        known_size,
+                        size,
+                    );
+                }
+            }
+
+            let writer_size = data.index.size();
+            if size != writer_size {
+                bail!(
+                    "fixed writer '{}' close failed - unexpected size ({size} != {writer_size})",
+                    data.name,
+                );
+            }
+        }
+
+        let expected_csum = data.index.close()?;
+        data.closed = true;
+
+        if csum != expected_csum {
+            bail!(
+                "fixed writer '{}' close failed - got unexpected checksum",
+                data.name
+            );
+        }
+
+        state
+            .uploaded_archives
+            .insert(writer_name.to_string(), csum);
+        state.file_counter += 1;
+        state.backup_size += size;
+        state.backup_stat = state.backup_stat + upload_stat;
+
+        self.log_upload_stat(
+            &writer_name,
+            &expected_csum,
+            &uuid,
+            size,
+            chunk_count,
+            &upload_stat,
+        );
+
+        // never hold mutex guard during s3 upload due to possible deadlocks
+        drop(state);
+
+        // For S3 backends, upload the index file to the object store after closing
+        if proxmox_async::runtime::block_on(
+            self.backend
+                .upload_index_to_backend(&self.backup_dir, writer_name.as_ref()),
+        )
+        .context("failed to upload fixed index to backend")?
+        {
+            self.log(format!(
+                "Uploaded fixed index file to object store: {writer_name}"
+            ))
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.fixed_writers.remove(&wid).is_none() {
+            bail!("dynamic writer '{wid}' no longer registered");
+        }
+
+        Ok(())
+    }
+
+    pub fn add_blob(&self, archive_name: &BackupArchiveName, data: Vec<u8>) -> Result<(), Error> {
+        let blob_len = data.len();
+        let orig_len = data.len(); // fixme:
+
+        // always verify blob/CRC at server side
+        let blob = DataBlob::load_from_reader(&mut &data[..])?;
+        let blob_csum = blob.csum();
+
+        let is_manifest = *archive_name == *MANIFEST_BLOB_NAME;
+        if is_manifest {
+            let manifest = BackupManifest::try_from(blob).map_err(|err| {
+                self.log(format!(
+                    "add manifest blob failed ({orig_len} bytes, comp: {blob_len}): {err}"
+                ));
+                err
+            })?;
+            self.register_manifest(manifest)?;
+        } else {
+            self.datastore.add_blob(
+                archive_name.as_ref(),
+                self.backup_dir.clone(),
+                blob,
+                &self.backend,
+            )?;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        // skip the manifest, it must not be able to list itself as one of its own archives
+        if !is_manifest {
+            state
+                .uploaded_archives
+                .insert(archive_name.to_string(), blob_csum);
+        }
+        state.file_counter += 1;
+        state.backup_size += orig_len as u64;
+        state.backup_stat.size += blob_len as u64;
+        drop(state);
+
+        let mut path = self.datastore.base_path();
+        path.push(self.backup_dir.relative_path());
+        path.push(archive_name.as_ref());
+
+        self.log(format!(
+            "add blob {path:?} ({orig_len} bytes, comp: {blob_len})"
+        ));
+
+        Ok(())
+    }
+
+    /// Mark backup as finished
+    pub fn finish_backup(&self) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
+        state.ensure_unfinished()?;
+
+        // test if all writer are correctly closed
+        if !state.dynamic_writers.is_empty() || !state.fixed_writers.is_empty() {
+            bail!("found open index writer - unable to finish backup");
+        }
+
+        if state.file_counter == 0 {
+            bail!("backup does not contain valid files (file count == 0)");
+        }
+
+        if let Some(base) = &self.last_backup {
+            let path = base.backup_dir.full_path();
+            if !path.exists() {
+                bail!(
+                    "base snapshot {} was removed during backup, cannot finish as chunks might be missing",
+                    base.backup_dir.dir(),
+                );
+            }
+        }
+        // drop previous snapshot lock
+        state.backup_lock_guards.previous_snapshot.take();
+        state.backup_lock_guards.chunk_store.take();
+
+        let Some(mut manifest) = state.manifest.take() else {
+            bail!("no backup manifest uploaded");
+        };
+
+        let stats = serde_json::to_value(state.backup_stat)?;
+
+        // check for valid manifest and store stats
+        manifest.unprotected["chunk_upload_stats"] = stats;
+
+        for file_info in manifest.files() {
+            let archive_name = file_info.filename.as_ref();
+            match state.uploaded_archives.get(archive_name) {
+                Some(csum) => {
+                    if *csum != file_info.csum {
+                        bail!("manifest contains '{archive_name}' with checksum mismatch");
+                    }
+                }
+                None => bail!("manifest contains '{archive_name}' not uploaded during backup"),
+            }
+        }
+
+        // keep existing signature
+        let manifest_blob = manifest.to_data_blob(None)?;
+
+        // make sure no other api calls can modify the backup state anymore
+        state.finished = BackupState::Finishing;
+
+        // never hold mutex guard during s3 upload due to possible deadlocks
+        drop(state);
+
+        self.datastore
+            .add_blob(
+                MANIFEST_BLOB_NAME.as_ref(),
+                self.backup_dir.clone(),
+                manifest_blob,
+                &self.backend,
+            )
+            .map_err(|err| format_err!("unable to persist manifest blob: {err}"))?;
+
+        let mut state = self.state.lock().unwrap();
+        if state.finished != BackupState::Finishing {
+            bail!("backup not in finishing state after manifest update");
+        }
+        self.datastore.try_ensure_sync_level()?;
+
+        // marks the backup as successful
+        state.finished = BackupState::Finished;
+
+        // drop snapshot and group lock only here so any error above will lead to
+        // the locks still being held in the env for the backup cleanup.
+        state.backup_lock_guards.snapshot.take();
+        state.backup_lock_guards.group.take();
+
+        Ok(())
+    }
+
+    /// If verify-new is set on the datastore, this will run a new verify task
+    /// for the backup. If not, this will return.
+    pub fn verify_after_complete(&self) -> Result<(), Error> {
+        self.ensure_finished()?;
+
+        if !self.datastore.verify_new() {
+            // no verify requested, do nothing
+            return Ok(());
+        }
+
+        // Get shared lock, the backup itself is finished
+        let snap_lock = self.backup_dir.lock_shared().with_context(|| {
+            format!(
+                "while trying to verify snapshot '{:?}' after completion",
+                self.backup_dir
+            )
+        })?;
+        let worker_id = format!(
+            "{}:{}/{}/{:08X}",
+            self.datastore.name(),
+            self.backup_dir.backup_type(),
+            self.backup_dir.backup_id(),
+            self.backup_dir.backup_time()
+        );
+
+        let datastore = self.datastore.clone();
+        let backup_dir = self.backup_dir.clone();
+
+        WorkerTask::new_thread(
+            "verify",
+            Some(worker_id),
+            self.auth_id.to_string(),
+            false,
+            move |worker| {
+                worker.log_message("Automatically verifying newly added snapshot");
+
+                // FIXME: update once per-datastore read/verify settings
+                // are available to not use default amount of threads here
+                let verify_worker = VerifyWorker::new(worker.clone(), datastore, None, None)?;
+                if !verify_worker.verify_backup_dir_with_lock(
+                    &backup_dir,
+                    worker.upid().clone(),
+                    None,
+                    snap_lock,
+                )? {
+                    bail!("verification failed - please check the log for details");
+                }
+
+                Ok(())
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub fn log<S: AsRef<str>>(&self, msg: S) {
+        info!("{}", msg.as_ref());
+    }
+
+    pub fn debug<S: AsRef<str>>(&self, msg: S) {
+        if self.debug {
+            // This is kinda weird, we would like to use tracing::debug! here and automatically
+            // filter it, but self.debug is set from the client-side and the logs are printed on
+            // client and server side. This means that if the client sets the log level to debug,
+            // both server and client need to have 'debug' logs printed.
+            self.log(msg);
+        }
+    }
+
+    pub fn format_response(&self, result: Result<Value, Error>) -> Response<Body> {
+        self.formatter.format_result(result, self)
+    }
+
+    /// Raise error if finished state is not set
+    pub fn ensure_finished(&self) -> Result<(), Error> {
+        if !self.finished() {
+            bail!("backup ended but finished state is not set.");
+        }
+        Ok(())
+    }
+
+    /// Return true if the finished state is set
+    pub fn finished(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.finished == BackupState::Finished
+    }
+}
+
+impl RpcEnvironment for BackupEnvironment {
+    fn result_attrib_mut(&mut self) -> &mut Value {
+        &mut self.result_attributes
+    }
+
+    fn result_attrib(&self) -> &Value {
+        &self.result_attributes
+    }
+
+    fn env_type(&self) -> RpcEnvironmentType {
+        self.env_type
+    }
+
+    fn set_auth_id(&mut self, _auth_id: Option<String>) {
+        panic!("unable to change auth_id");
+    }
+
+    fn get_auth_id(&self) -> Option<String> {
+        Some(self.auth_id.to_string())
+    }
+}
+
+impl AsRef<BackupEnvironment> for dyn RpcEnvironment {
+    fn as_ref(&self) -> &BackupEnvironment {
+        self.as_any().downcast_ref::<BackupEnvironment>().unwrap()
+    }
+}
+
+impl AsRef<BackupEnvironment> for Box<dyn RpcEnvironment> {
+    fn as_ref(&self) -> &BackupEnvironment {
+        self.as_any().downcast_ref::<BackupEnvironment>().unwrap()
+    }
+}

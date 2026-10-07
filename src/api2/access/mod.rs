@@ -1,0 +1,354 @@
+//! Access control (Users, Permissions and Authentication)
+
+use anyhow::{Error, bail, format_err};
+
+use hyper::Response;
+use hyper::header::CONTENT_TYPE;
+use hyper::http::request::Parts;
+use serde_json::{Value, json};
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use proxmox_auth_api::api::{API_METHOD_CREATE_TICKET_HTTP_ONLY, API_METHOD_VERIFY_VNC_TICKET};
+use proxmox_auth_api::types::{CreateTicket, CreateTicketResponse};
+use proxmox_router::{
+    ApiHandler, ApiMethod, ApiResponseFuture, Permission, Router, RpcEnvironment, SubdirMap,
+    http_bail, http_err, list_subdirs_api_method,
+};
+use proxmox_schema::{
+    AllOfSchema, ApiType, BooleanSchema, ObjectSchema, ParameterSchema, ReturnType, api,
+};
+use proxmox_sortable_macro::sortable;
+
+use pbs_api_types::{
+    ACL_PATH_SCHEMA, Authid, PASSWORD_FORMAT, PBS_PASSWORD_SCHEMA, PRIV_PERMISSIONS_MODIFY,
+    PRIV_SYS_AUDIT, PRIVILEGES, User, Userid,
+};
+use pbs_config::CachedUserInfo;
+use pbs_config::acl::AclTreeNode;
+
+pub mod acl;
+pub mod domain;
+pub mod openid;
+pub mod role;
+pub mod tfa;
+pub mod user;
+
+/// Perform first-factor (password) authentication only. Ignore password for the root user.
+/// Otherwise check the current user's password.
+///
+/// This means that user admins need to type in their own password while editing a user, and
+/// regular users, which can only change their own settings (checked at the API level), can change
+/// their own settings using their own password.
+async fn user_update_auth<S: AsRef<str>>(
+    rpcenv: &mut dyn RpcEnvironment,
+    userid: &Userid,
+    password: Option<S>,
+    must_exist: bool,
+) -> Result<(), Error> {
+    let authid: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+
+    if authid.user() != Userid::root_userid() {
+        let client_ip = rpcenv.get_client_ip().map(|sa| sa.ip());
+        let password = password.ok_or_else(|| http_err!(UNAUTHORIZED, "missing password"))?;
+        #[allow(clippy::let_unit_value)]
+        {
+            let _: () = crate::auth::authenticate_user(
+                authid.user(),
+                password.as_ref(),
+                client_ip.as_ref(),
+            )
+            .await
+            .map_err(|err| http_err!(UNAUTHORIZED, "{}", err))?;
+        }
+    }
+
+    // After authentication, verify that the to-be-modified user actually exists:
+    if must_exist && authid.user() != userid {
+        let (config, _digest) = pbs_config::user::config()?;
+
+        if config.lookup::<User>("user", userid.as_str()).is_err() {
+            http_bail!(UNAUTHORIZED, "user '{}' does not exists.", userid);
+        }
+    }
+
+    Ok(())
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            userid: {
+                type: Userid,
+            },
+            password: {
+                schema: PBS_PASSWORD_SCHEMA,
+            },
+            "confirmation-password": {
+                type: String,
+                description: "The current password for confirmation, unless logged in as root@pam",
+                min_length: 1,
+                max_length: 1024,
+                format: &PASSWORD_FORMAT,
+                optional: true,
+            },
+        },
+    },
+    access: {
+        description: "Everybody is allowed to change their own password. In addition, users with 'Permissions:Modify' privilege may change any password on @pbs realm.",
+        permission: &Permission::Anybody,
+    },
+)]
+/// Change user password
+///
+/// Each user is allowed to change his own password. Superuser
+/// can change all passwords.
+pub async fn change_password(
+    userid: Userid,
+    password: String,
+    confirmation_password: Option<String>,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<Value, Error> {
+    user_update_auth(rpcenv, &userid, confirmation_password, true).await?;
+
+    let current_auth: Authid = rpcenv
+        .get_auth_id()
+        .ok_or_else(|| format_err!("no authid available"))?
+        .parse()?;
+
+    if current_auth.is_token() {
+        bail!("API tokens cannot access this API endpoint");
+    }
+
+    let current_user = current_auth.user();
+
+    let mut allowed = userid == *current_user;
+
+    if !allowed {
+        let user_info = CachedUserInfo::new()?;
+        let privs = user_info.lookup_privs(&current_auth, &[]);
+        if user_info.is_superuser(&current_auth) {
+            allowed = true;
+        }
+        if (privs & PRIV_PERMISSIONS_MODIFY) != 0 && userid.realm() != "pam" {
+            allowed = true;
+        }
+    };
+
+    if !allowed {
+        bail!("you are not authorized to change the password.");
+    }
+
+    let authenticator = crate::auth::lookup_authenticator(userid.realm())?;
+    let client_ip = rpcenv.get_client_ip().map(|sa| sa.ip());
+    authenticator.store_password(userid.name(), &password, client_ip.as_ref())?;
+
+    Ok(Value::Null)
+}
+
+#[api(
+    input: {
+        properties: {
+            "auth-id": {
+                type: Authid,
+                optional: true,
+            },
+            path: {
+                schema: ACL_PATH_SCHEMA,
+                optional: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Anybody,
+        description: "Requires Sys.Audit on '/access', limited to own privileges otherwise.",
+    },
+    returns: {
+        description: "Map of ACL path to Map of privilege to propagate bit",
+        type: Object,
+        properties: {},
+        additional_properties: true,
+    },
+)]
+/// List permissions of given or currently authenticated user / API token.
+///
+/// Optionally limited to specific path.
+pub fn list_permissions(
+    auth_id: Option<Authid>,
+    path: Option<String>,
+    rpcenv: &dyn RpcEnvironment,
+) -> Result<HashMap<String, HashMap<String, bool>>, Error> {
+    let current_auth_id: Authid = rpcenv.get_auth_id().unwrap().parse()?;
+
+    let user_info = CachedUserInfo::new()?;
+    let user_privs = user_info.lookup_privs(&current_auth_id, &["access"]);
+
+    let auth_id = match auth_id {
+        Some(auth_id) if auth_id == current_auth_id => current_auth_id,
+        Some(auth_id) => {
+            if user_privs & PRIV_SYS_AUDIT != 0
+                || (auth_id.is_token()
+                    && !current_auth_id.is_token()
+                    && auth_id.user() == current_auth_id.user())
+            {
+                auth_id
+            } else {
+                bail!("not allowed to list permissions of {}", auth_id);
+            }
+        }
+        None => current_auth_id,
+    };
+
+    fn populate_acl_paths(
+        mut paths: HashSet<String>,
+        node: AclTreeNode,
+        path: &str,
+    ) -> HashSet<String> {
+        for (sub_path, child_node) in node.children {
+            let sub_path = format!("{}/{}", path, &sub_path);
+            paths = populate_acl_paths(paths, child_node, &sub_path);
+            paths.insert(sub_path);
+        }
+        paths
+    }
+
+    let paths = match path {
+        Some(path) => {
+            let mut paths = HashSet::new();
+            paths.insert(path);
+            paths
+        }
+        None => {
+            let mut paths = HashSet::new();
+
+            let (acl_tree, _) = pbs_config::acl::config()?;
+            paths = populate_acl_paths(paths, acl_tree.root, "");
+
+            // default paths, returned even if no ACL exists
+            paths.insert("/".to_string());
+            paths.insert("/access".to_string());
+            paths.insert("/datastore".to_string());
+            paths.insert("/remote".to_string());
+            paths.insert("/system".to_string());
+
+            paths
+        }
+    };
+
+    let map = paths.into_iter().fold(
+        HashMap::new(),
+        |mut map: HashMap<String, HashMap<String, bool>>, path: String| {
+            let split_path = pbs_config::acl::split_acl_path(path.as_str());
+            let (privs, propagated_privs) = user_info.lookup_privs_details(&auth_id, &split_path);
+
+            match privs {
+                0 => map, // Don't leak ACL paths where we don't have any privileges
+                _ => {
+                    let priv_map =
+                        PRIVILEGES
+                            .iter()
+                            .fold(HashMap::new(), |mut priv_map, (name, value)| {
+                                if value & privs != 0 {
+                                    priv_map
+                                        .insert(name.to_string(), value & propagated_privs != 0);
+                                }
+                                priv_map
+                            });
+
+                    map.insert(path, priv_map);
+                    map
+                }
+            }
+        },
+    );
+
+    Ok(map)
+}
+
+#[sortable]
+const SUBDIRS: SubdirMap = &sorted!([
+    ("acl", &acl::ROUTER),
+    ("password", &Router::new().put(&API_METHOD_CHANGE_PASSWORD)),
+    (
+        "permissions",
+        &Router::new().get(&API_METHOD_LIST_PERMISSIONS)
+    ),
+    (
+        "ticket",
+        &Router::new()
+            .post(&API_METHOD_CREATE_TICKET_TOGGLE)
+            .delete(&proxmox_auth_api::api::API_METHOD_LOGOUT)
+    ),
+    (
+        "vncticket",
+        &Router::new().post(&API_METHOD_VERIFY_VNC_TICKET)
+    ),
+    ("openid", &openid::ROUTER),
+    ("domains", &domain::ROUTER),
+    ("roles", &role::ROUTER),
+    ("users", &user::ROUTER),
+    ("tfa", &tfa::ROUTER),
+]);
+
+const API_METHOD_CREATE_TICKET_TOGGLE: ApiMethod = ApiMethod::new_full(
+    &proxmox_router::ApiHandler::AsyncHttpBodyParameters(&handle_ticket_toggle),
+    ParameterSchema::AllOf(&AllOfSchema::new(
+        "Either create a new HttpOnly ticket or a regular ticket.",
+        &[
+            &ObjectSchema::new(
+                "<INNER: Toggle between HttpOnly or legacy ticket endpoints.>",
+                &[(
+                    "http-only",
+                    true,
+                    &BooleanSchema::new("Whether the HttpOnly authentication flow should be used.")
+                        .default(false)
+                        .schema(),
+                )],
+            )
+            .schema(),
+            &CreateTicket::API_SCHEMA,
+        ],
+    )),
+)
+.returns(ReturnType::new(false, &CreateTicketResponse::API_SCHEMA))
+.protected(true)
+.access(None, &Permission::World);
+
+fn handle_ticket_toggle(
+    parts: Parts,
+    mut param: Value,
+    info: &'static ApiMethod,
+    mut rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    // If the client specifies that they want to use HttpOnly cookies, prefer those.
+    if Some(true) == param["http-only"].take().as_bool() {
+        if let ApiHandler::AsyncHttpBodyParameters(handler) =
+            API_METHOD_CREATE_TICKET_HTTP_ONLY.handler
+        {
+            tracing::debug!("client requests HttpOnly authentication, using new endpoint...");
+            return handler(parts, param, info, rpcenv);
+        }
+    }
+
+    // Otherwise, default back to the previous ticket method.
+    Box::pin(async move {
+        let create_params: CreateTicket = serde_json::from_value(param)?;
+
+        let ticket_response =
+            proxmox_auth_api::api::create_ticket(create_params, rpcenv.as_mut()).await?;
+
+        let response = Response::builder().header(CONTENT_TYPE, "application/json");
+
+        Ok(response.body(
+            json!({"data": ticket_response, "status": 200, "success": true })
+                .to_string()
+                .into(),
+        )?)
+    })
+}
+
+pub const ROUTER: Router = Router::new()
+    .get(&list_subdirs_api_method!(SUBDIRS))
+    .subdirs(SUBDIRS);

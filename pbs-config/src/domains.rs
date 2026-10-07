@@ -1,0 +1,137 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use anyhow::Error;
+
+use pbs_buildcfg::configdir;
+use proxmox_product_config::replace_privileged_config;
+use proxmox_schema::{ApiType, ObjectSchema};
+use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
+
+use crate::{BackupLockGuard, open_backup_lockfile};
+use pbs_api_types::{
+    AdRealmConfig, LdapRealmConfig, OpenIdRealmConfig, PamRealmConfig, PbsRealmConfig,
+    REALM_ID_SCHEMA,
+};
+
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
+
+fn init() -> SectionConfig {
+    const PAM_SCHEMA: &ObjectSchema = PamRealmConfig::API_SCHEMA.unwrap_object_schema();
+    const PBS_SCHEMA: &ObjectSchema = PbsRealmConfig::API_SCHEMA.unwrap_object_schema();
+    const AD_SCHEMA: &ObjectSchema = AdRealmConfig::API_SCHEMA.unwrap_object_schema();
+    const LDAP_SCHEMA: &ObjectSchema = LdapRealmConfig::API_SCHEMA.unwrap_object_schema();
+    const OPENID_SCHEMA: &ObjectSchema = OpenIdRealmConfig::API_SCHEMA.unwrap_object_schema();
+
+    let mut config = SectionConfig::new(&REALM_ID_SCHEMA);
+
+    config.register_plugin(SectionConfigPlugin::new(
+        "pam".to_owned(),
+        Some("realm".to_owned()),
+        PAM_SCHEMA,
+    ));
+
+    config.register_plugin(SectionConfigPlugin::new(
+        "pbs".to_owned(),
+        Some("realm".to_owned()),
+        PBS_SCHEMA,
+    ));
+
+    let plugin = SectionConfigPlugin::new(
+        "openid".to_string(),
+        Some(String::from("realm")),
+        OPENID_SCHEMA,
+    );
+
+    config.register_plugin(plugin);
+
+    let plugin =
+        SectionConfigPlugin::new("ldap".to_string(), Some(String::from("realm")), LDAP_SCHEMA);
+
+    config.register_plugin(plugin);
+
+    let plugin = SectionConfigPlugin::new("ad".to_string(), Some(String::from("realm")), AD_SCHEMA);
+
+    config.register_plugin(plugin);
+
+    config
+}
+
+pub const DOMAINS_CFG_FILENAME: &str = configdir!("/domains.cfg");
+pub const DOMAINS_CFG_LOCKFILE: &str = configdir!("/.domains.lck");
+
+/// Get exclusive lock
+pub fn lock_config() -> Result<BackupLockGuard, Error> {
+    open_backup_lockfile(DOMAINS_CFG_LOCKFILE, None, true)
+}
+
+pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
+    let content =
+        proxmox_sys::fs::file_read_optional_string(DOMAINS_CFG_FILENAME)?.unwrap_or_default();
+
+    let digest = openssl::sha::sha256(content.as_bytes());
+    let data = CONFIG.parse(DOMAINS_CFG_FILENAME, &content)?;
+    Ok((data, digest))
+}
+
+pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
+    let raw = CONFIG.write(DOMAINS_CFG_FILENAME, config)?;
+    replace_privileged_config(DOMAINS_CFG_FILENAME, raw.as_bytes())
+}
+
+/// Unsets the default login realm for users by deleting the `default` property
+/// from the respective realm.
+///
+/// This only updates the configuration as given in `config`, making it
+/// permanent is left to the caller.
+pub fn unset_default_realm(config: &mut SectionConfigData) -> Result<(), Error> {
+    for (_, data) in &mut config.sections.values_mut() {
+        if let Some(obj) = data.as_object_mut() {
+            obj.remove("default");
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a realm with the given name exists
+pub fn exists(domains: &SectionConfigData, realm: &str) -> bool {
+    domains.sections.contains_key(realm)
+}
+
+// shell completion helper
+pub fn complete_realm_name(_arg: &str, _param: &HashMap<String, String>) -> Vec<String> {
+    match config() {
+        Ok((data, _digest)) => data.sections.keys().map(|id| id.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn complete_realm_of_type(realm_type: &str) -> Vec<String> {
+    match config() {
+        Ok((data, _digest)) => data
+            .sections
+            .iter()
+            .filter_map(|(id, (t, _))| {
+                if t == realm_type {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn complete_openid_realm_name(_arg: &str, _param: &HashMap<String, String>) -> Vec<String> {
+    complete_realm_of_type("openid")
+}
+
+pub fn complete_ldap_realm_name(_arg: &str, _param: &HashMap<String, String>) -> Vec<String> {
+    complete_realm_of_type("ldap")
+}
+
+pub fn complete_ad_realm_name(_arg: &str, _param: &HashMap<String, String>) -> Vec<String> {
+    complete_realm_of_type("ad")
+}

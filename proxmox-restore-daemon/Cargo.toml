@@ -1,0 +1,41 @@
+[package]
+name = "proxmox-restore-daemon"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+description = "Proxmox Restore Daemon"
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+futures.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = [ "service" ] }
+libc.workspace = true
+log.workspace = true
+nix = { workspace = true, features = [ "mount", "reboot" ] }
+regex.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "parking_lot", "sync"] }
+tokio-stream.workspace = true
+tokio-util = { workspace = true, features = [ "codec" ] }
+
+pathpatterns.workspace = true
+pxar.workspace = true
+
+proxmox-async.workspace = true
+proxmox-base64.workspace = true
+proxmox-compression.workspace = true
+proxmox-http.workspace = true
+proxmox-rest-server.workspace = true
+proxmox-router = { workspace = true, features = [ "cli", "server" ] }
+proxmox-schema = { workspace = true, features = [ "api-macro" ] }
+proxmox-sortable-macro.workspace = true
+proxmox-sys.workspace = true
+proxmox-time.workspace = true
+
+pbs-api-types.workspace = true
+pbs-client.workspace = true
+pbs-datastore.workspace = true
+pbs-tools.workspace = true

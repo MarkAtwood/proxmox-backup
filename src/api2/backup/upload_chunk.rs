@@ -1,0 +1,344 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use anyhow::{Error, bail, format_err};
+use futures::*;
+use hex::FromHex;
+use http_body_util::{BodyDataStream, BodyExt};
+use hyper::body::Incoming;
+use hyper::http::request::Parts;
+use serde_json::{Value, json};
+use tokio::task::spawn_blocking;
+
+use proxmox_router::{ApiHandler, ApiMethod, ApiResponseFuture, RpcEnvironment};
+use proxmox_schema::*;
+use proxmox_sortable_macro::sortable;
+
+use pbs_api_types::{
+    ArchiveType, BACKUP_ARCHIVE_NAME_SCHEMA, BackupArchiveName, CHUNK_DIGEST_SCHEMA,
+};
+use pbs_datastore::DataBlob;
+use pbs_datastore::file_formats::{DataBlobHeader, EncryptedDataBlobHeader};
+use pbs_tools::json::{required_integer_param, required_string_param};
+
+use super::environment::*;
+
+pub struct UploadChunk {
+    stream: BodyDataStream<Incoming>,
+    digest: [u8; 32],
+    size: u32,
+    encoded_size: u32,
+    raw_data: Option<Vec<u8>>,
+}
+
+impl UploadChunk {
+    pub fn new(
+        stream: BodyDataStream<Incoming>,
+        digest: [u8; 32],
+        size: u32,
+        encoded_size: u32,
+    ) -> Self {
+        Self {
+            stream,
+            size,
+            encoded_size,
+            raw_data: Some(vec![]),
+            digest,
+        }
+    }
+}
+
+impl Future for UploadChunk {
+    type Output = Result<([u8; 32], u32, DataBlob), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        let err: Error = loop {
+            match ready!(Pin::new(&mut this.stream).poll_next(cx)) {
+                Some(Err(err)) => return Poll::Ready(Err(Error::from(err))),
+                Some(Ok(input)) => {
+                    if let Some(ref mut raw_data) = this.raw_data {
+                        if (raw_data.len() + input.len()) > (this.encoded_size as usize) {
+                            break format_err!("uploaded chunk is larger than announced.");
+                        }
+                        raw_data.extend_from_slice(&input);
+                    } else {
+                        break format_err!("poll upload chunk stream failed - already finished.");
+                    }
+                }
+                None => {
+                    if let Some(raw_data) = this.raw_data.take() {
+                        if raw_data.len() != (this.encoded_size as usize) {
+                            break format_err!("uploaded chunk has unexpected size.");
+                        }
+
+                        let chunk = match proxmox_lang::try_block! {
+                            let mut chunk = DataBlob::from_raw(raw_data)?;
+
+                            proxmox_async::runtime::block_in_place(|| {
+                                chunk.verify_unencrypted(this.size as usize, &this.digest)?;
+
+                                // always comput CRC at server side
+                                chunk.set_crc(chunk.compute_crc());
+                                Ok(chunk)
+                            })
+                        } {
+                            Ok(res) => res,
+                            Err(err) => break err,
+                        };
+
+                        return Poll::Ready(Ok((this.digest, this.size, chunk)));
+                    } else {
+                        break format_err!("poll upload chunk stream failed - already finished.");
+                    }
+                }
+            }
+        };
+        Poll::Ready(Err(err))
+    }
+}
+
+#[sortable]
+pub const API_METHOD_UPLOAD_FIXED_CHUNK: ApiMethod = ApiMethod::new(
+    &ApiHandler::AsyncHttp(&upload_fixed_chunk),
+    &ObjectSchema::new(
+        "Upload a new chunk.",
+        &sorted!([
+            (
+                "wid",
+                false,
+                &IntegerSchema::new("Fixed writer ID.")
+                    .minimum(1)
+                    .maximum(256)
+                    .schema()
+            ),
+            ("digest", false, &CHUNK_DIGEST_SCHEMA),
+            (
+                "size",
+                false,
+                &IntegerSchema::new("Chunk size.")
+                    .minimum(1)
+                    .maximum(1024 * 1024 * 16)
+                    .schema()
+            ),
+            (
+                "encoded-size",
+                false,
+                &IntegerSchema::new("Encoded chunk size.")
+                    .minimum((std::mem::size_of::<DataBlobHeader>() as i64) + 1)
+                    .maximum(
+                        1024 * 1024 * 16 + (std::mem::size_of::<EncryptedDataBlobHeader>() as i64)
+                    )
+                    .schema()
+            ),
+        ]),
+    ),
+);
+
+fn upload_fixed_chunk(
+    _parts: Parts,
+    req_body: Incoming,
+    param: Value,
+    _info: &ApiMethod,
+    rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    async move {
+        let wid = required_integer_param(&param, "wid")? as usize;
+        let env: &BackupEnvironment = rpcenv.as_ref();
+
+        let (digest, size, compressed_size, is_duplicate) =
+            upload_to_backend(req_body, param, env).await?;
+
+        env.register_fixed_chunk(wid, digest, size, compressed_size, is_duplicate)?;
+        let digest_str = hex::encode(digest);
+        env.debug(format!("upload_chunk done: {size} bytes, {digest_str}"));
+
+        let result = Ok(json!(digest_str));
+
+        Ok(env.format_response(result))
+    }
+    .boxed()
+}
+
+#[sortable]
+pub const API_METHOD_UPLOAD_DYNAMIC_CHUNK: ApiMethod = ApiMethod::new(
+    &ApiHandler::AsyncHttp(&upload_dynamic_chunk),
+    &ObjectSchema::new(
+        "Upload a new chunk.",
+        &sorted!([
+            (
+                "wid",
+                false,
+                &IntegerSchema::new("Dynamic writer ID.")
+                    .minimum(1)
+                    .maximum(256)
+                    .schema()
+            ),
+            ("digest", false, &CHUNK_DIGEST_SCHEMA),
+            (
+                "size",
+                false,
+                &IntegerSchema::new("Chunk size.")
+                    .minimum(1)
+                    .maximum(1024 * 1024 * 16)
+                    .schema()
+            ),
+            (
+                "encoded-size",
+                false,
+                &IntegerSchema::new("Encoded chunk size.")
+                    .minimum((std::mem::size_of::<DataBlobHeader>() as i64) + 1)
+                    .maximum(
+                        1024 * 1024 * 16 + (std::mem::size_of::<EncryptedDataBlobHeader>() as i64)
+                    )
+                    .schema()
+            ),
+        ]),
+    ),
+);
+
+fn upload_dynamic_chunk(
+    _parts: Parts,
+    req_body: Incoming,
+    param: Value,
+    _info: &ApiMethod,
+    rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    async move {
+        let wid = required_integer_param(&param, "wid")? as usize;
+        let env: &BackupEnvironment = rpcenv.as_ref();
+
+        let (digest, size, compressed_size, is_duplicate) =
+            upload_to_backend(req_body, param, env).await?;
+
+        env.register_dynamic_chunk(wid, digest, size, compressed_size, is_duplicate)?;
+        let digest_str = hex::encode(digest);
+        env.debug(format!("upload_chunk done: {size} bytes, {digest_str}"));
+
+        let result = Ok(json!(digest_str));
+        Ok(env.format_response(result))
+    }
+    .boxed()
+}
+
+async fn upload_to_backend(
+    req_body: Incoming,
+    param: Value,
+    env: &BackupEnvironment,
+) -> Result<([u8; 32], u32, u32, bool), Error> {
+    let size = required_integer_param(&param, "size")? as u32;
+    let encoded_size = required_integer_param(&param, "encoded-size")? as u32;
+    let digest_str = required_string_param(&param, "digest")?;
+    let digest = <[u8; 32]>::from_hex(digest_str)?;
+
+    let (digest, size, chunk) =
+        UploadChunk::new(BodyDataStream::new(req_body), digest, size, encoded_size).await?;
+
+    let datastore = Arc::clone(&env.datastore);
+    let backend = env.backend.clone();
+
+    if env.no_cache {
+        let (is_duplicate, chunk_size) =
+            spawn_blocking(move || datastore.insert_chunk_no_cache(&chunk, &digest, &backend))
+                .await??;
+        return Ok((digest, size, chunk_size as u32, is_duplicate));
+    }
+
+    let (is_duplicate, chunk_size) =
+        spawn_blocking(move || datastore.insert_chunk(&chunk, &digest, &backend)).await??;
+    Ok((digest, size, chunk_size as u32, is_duplicate))
+}
+
+pub const API_METHOD_UPLOAD_SPEEDTEST: ApiMethod = ApiMethod::new(
+    &ApiHandler::AsyncHttp(&upload_speedtest),
+    &ObjectSchema::new("Test upload speed.", &[]),
+);
+
+fn upload_speedtest(
+    _parts: Parts,
+    req_body: Incoming,
+    _param: Value,
+    _info: &ApiMethod,
+    rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    async move {
+        let result = BodyDataStream::new(req_body)
+            .map_err(Error::from)
+            .try_fold(0, |size: usize, chunk| {
+                let sum = size + chunk.len();
+                //println!("UPLOAD {} bytes, sum {}", chunk.len(), sum);
+                future::ok::<usize, Error>(sum)
+            })
+            .await;
+
+        match result {
+            Ok(size) => {
+                println!("UPLOAD END {size} bytes");
+            }
+            Err(err) => {
+                println!("Upload error: {err}");
+            }
+        }
+        let env: &BackupEnvironment = rpcenv.as_ref();
+        Ok(env.format_response(Ok(Value::Null)))
+    }
+    .boxed()
+}
+
+#[sortable]
+pub const API_METHOD_UPLOAD_BLOB: ApiMethod = ApiMethod::new(
+    &ApiHandler::AsyncHttp(&upload_blob),
+    &ObjectSchema::new(
+        "Upload binary blob file.",
+        &sorted!([
+            ("file-name", false, &BACKUP_ARCHIVE_NAME_SCHEMA),
+            (
+                "encoded-size",
+                false,
+                &IntegerSchema::new("Encoded blob size.")
+                    .minimum(std::mem::size_of::<DataBlobHeader>() as i64)
+                    .maximum(
+                        1024 * 1024 * 16 + (std::mem::size_of::<EncryptedDataBlobHeader>() as i64)
+                    )
+                    .schema()
+            )
+        ]),
+    ),
+);
+
+fn upload_blob(
+    _parts: Parts,
+    req_body: Incoming,
+    param: Value,
+    _info: &ApiMethod,
+    rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    async move {
+        let file_name = required_string_param(&param, "file-name")?;
+        let archive_name = BackupArchiveName::try_from_strict(file_name)?;
+        let encoded_size = required_integer_param(&param, "encoded-size")? as usize;
+
+        let env: &BackupEnvironment = rpcenv.as_ref();
+
+        if archive_name.archive_type() != ArchiveType::Blob {
+            bail!("wrong blob file extension: '{}'", file_name);
+        }
+
+        let data = req_body.collect().await.map_err(Error::from)?.to_bytes();
+
+        if encoded_size != data.len() {
+            bail!(
+                "got blob with unexpected length ({} != {})",
+                encoded_size,
+                data.len()
+            );
+        }
+
+        env.add_blob(&archive_name, data.to_vec())?;
+
+        Ok(env.format_response(Ok(Value::Null)))
+    }
+    .boxed()
+}

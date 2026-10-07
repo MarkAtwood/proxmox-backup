@@ -1,0 +1,14 @@
+
+Job ID:    {{job-id}}
+Datastore: {{datastore}}
+
+Verification failed on these snapshots/groups:
+
+{{#each failed-snapshot-list}}
+    {{this}}
+{{/each}}
+
+
+Please visit the web interface for further details:
+
+<{{base-url}}/#pbsServerAdministration:tasks>

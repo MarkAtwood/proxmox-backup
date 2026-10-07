@@ -1,0 +1,129 @@
+use anyhow::Error;
+use serde_json::json;
+
+use proxmox_notify::context::pbs::PBS_CONTEXT;
+use proxmox_router::{ApiHandler, RpcEnvironment, cli::*};
+use proxmox_subscription::SubscriptionStatus;
+
+use pbs_buildcfg::configdir;
+use proxmox_backup::api2;
+
+async fn wait_for_local_worker(upid_str: &str) -> Result<(), Error> {
+    let upid: pbs_api_types::UPID = upid_str.parse()?;
+    let poll_delay = core::time::Duration::from_millis(100);
+
+    loop {
+        if !proxmox_rest_server::worker_is_active_local(&upid) {
+            break;
+        }
+        tokio::time::sleep(poll_delay).await;
+    }
+    Ok(())
+}
+
+/// Daily update
+async fn do_update(rpcenv: &mut dyn RpcEnvironment) -> Result<(), Error> {
+    let param = json!({});
+
+    let method = &api2::node::subscription::API_METHOD_CHECK_SUBSCRIPTION;
+    match method.handler {
+        ApiHandler::Sync(handler) => {
+            if let Err(err) = (handler)(param.clone(), method, rpcenv) {
+                log::error!("Error checking subscription - {err}");
+            }
+        }
+        _ => unreachable!(),
+    }
+    let notify = match api2::node::subscription::get_subscription(param, rpcenv) {
+        Ok(info) => info.status == SubscriptionStatus::Active,
+        Err(err) => {
+            log::error!("Error reading subscription - {err}");
+            false
+        }
+    };
+
+    let param = json!({
+        "notify": notify,
+    });
+    let method = &api2::node::apt::API_METHOD_APT_UPDATE_DATABASE;
+    match method.handler {
+        ApiHandler::Sync(handler) => match (handler)(param, method, rpcenv) {
+            Err(err) => {
+                log::error!("Error triggering apt database update - {err}");
+            }
+            Ok(upid) => wait_for_local_worker(upid.as_str().unwrap()).await?,
+        },
+        _ => unreachable!(),
+    };
+
+    if let Err(err) = check_acme_certificates(rpcenv).await {
+        log::error!("error checking certificates: {err}");
+    }
+
+    // TODO: cleanup tasks like in PVE?
+
+    Ok(())
+}
+
+async fn check_acme_certificates(rpcenv: &mut dyn RpcEnvironment) -> Result<(), Error> {
+    let (config, _) = pbs_config::node::config()?;
+
+    // do we even have any acme domains configures?
+    if config.acme_domains().next().is_none() {
+        return Ok(());
+    }
+
+    let (expires_soon, lead_days) = api2::node::certificates::check_renewal_needed()?;
+    if !expires_soon {
+        log::info!("Certificate does not expire within the next {lead_days} days, not renewing.");
+        return Ok(());
+    }
+
+    let info = &api2::node::certificates::API_METHOD_RENEW_ACME_CERT;
+    let result = match info.handler {
+        ApiHandler::Sync(handler) => (handler)(json!({}), info, rpcenv)?,
+        _ => unreachable!(),
+    };
+    wait_for_local_worker(result.as_str().unwrap()).await?;
+
+    Ok(())
+}
+
+async fn run(rpcenv: &mut dyn RpcEnvironment) -> Result<(), Error> {
+    proxmox_product_config::init(pbs_config::backup_user()?, pbs_config::priv_user()?);
+    proxmox_rest_server::init_worker_tasks(
+        pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR_M!().into(),
+        proxmox_product_config::default_create_options(),
+    )?;
+
+    let mut command_sock = proxmox_daemon::command_socket::CommandSocket::new(
+        proxmox_product_config::get_api_user().gid,
+    );
+    proxmox_rest_server::register_task_control_commands(&mut command_sock)?;
+    command_sock.spawn(proxmox_rest_server::last_worker_future())?;
+
+    proxmox_notify::context::set_context(&PBS_CONTEXT);
+
+    proxmox_acme_api::init(configdir!("/acme"), false)?;
+
+    do_update(rpcenv).await
+}
+
+fn main() {
+    proxmox_backup::tools::setup_safe_path_env();
+
+    // We need to use the tasklog layer here because we call a workertask.
+    proxmox_log::Logger::from_env("PBS_LOG", proxmox_log::LevelFilter::INFO)
+        .journald_on_no_workertask()
+        .tasklog_pbs()
+        .init()
+        .expect("unable to initialize logger");
+
+    let mut rpcenv = CliEnvironment::new();
+    rpcenv.set_auth_id(Some(String::from("root@pam")));
+
+    if let Err(err) = proxmox_async::runtime::main(run(&mut rpcenv)) {
+        log::error!("error during update: {err}");
+        std::process::exit(1);
+    }
+}

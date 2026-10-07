@@ -1,0 +1,251 @@
+Ext.define('PBS.window.S3ClientEdit', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pbsS3ClientEdit',
+    mixins: ['Proxmox.Mixin.CBind'],
+
+    onlineHelp: 'datastore-s3-backend',
+
+    isAdd: true,
+
+    subject: gettext('S3 Endpoint'),
+
+    fieldDefaults: { labelWidth: 120 },
+
+    cbindData: function (initialConfig) {
+        let me = this;
+
+        let baseurl = '/api2/extjs/config/s3';
+        let id = initialConfig.id;
+
+        me.isCreate = !id;
+        me.url = id ? `${baseurl}/${id}` : baseurl;
+        me.method = id ? 'PUT' : 'POST';
+        me.autoLoad = !!id;
+        return {
+            passwordEmptyText: me.isCreate ? '' : gettext('Unchanged'),
+        };
+    },
+
+    items: {
+        xtype: 'inputpanel',
+        column1: [
+            {
+                xtype: 'pmxDisplayEditField',
+                name: 'id',
+                fieldLabel: gettext('S3 Endpoint ID'),
+                renderer: Ext.htmlEncode,
+                allowBlank: false,
+                minLength: 4,
+                cbind: {
+                    editable: '{isCreate}',
+                },
+            },
+            {
+                xtype: 'proxmoxtextfield',
+                name: 'endpoint',
+                fieldLabel: gettext('Endpoint'),
+                allowBlank: false,
+                emptyText: gettext('e.g. {{bucket}}.s3.{{region}}.amazonaws.com'),
+                autoEl: {
+                    tag: 'div',
+                    'data-qtip': gettext(
+                        'IP or FQDN S3 endpoint (allows {{bucket}} or {{region}} templating)',
+                    ),
+                },
+            },
+            {
+                xtype: 'proxmoxtextfield',
+                name: 'port',
+                fieldLabel: gettext('Port'),
+                emptyText: gettext('default (443)'),
+                cbind: {
+                    deleteEmpty: '{!isCreate}',
+                },
+            },
+            {
+                xtype: 'proxmoxcheckbox',
+                name: 'path-style',
+                fieldLabel: gettext('Path Style'),
+                autoEl: {
+                    tag: 'div',
+                    'data-qtip': gettext('Use path style over vhost style bucket addressing.'),
+                },
+                uncheckedValue: false,
+                value: false,
+            },
+        ],
+
+        column2: [
+            {
+                xtype: 'proxmoxtextfield',
+                name: 'region',
+                fieldLabel: gettext('Region'),
+                emptyText: gettext('default (us-west-1)'),
+                cbind: {
+                    deleteEmpty: '{!isCreate}',
+                },
+            },
+            {
+                xtype: 'proxmoxtextfield',
+                name: 'access-key',
+                fieldLabel: gettext('Access Key'),
+                cbind: {
+                    emptyText: '{passwordEmptyText}',
+                    allowBlank: '{!isCreate}',
+                },
+            },
+            {
+                xtype: 'textfield',
+                name: 'secret-key',
+                inputType: 'password',
+                fieldLabel: gettext('Secret Key'),
+                cbind: {
+                    emptyText: '{passwordEmptyText}',
+                    allowBlank: '{!isCreate}',
+                },
+            },
+        ],
+
+        columnB: [
+            {
+                xtype: 'proxmoxtextfield',
+                name: 'fingerprint',
+                fieldLabel: gettext('Fingerprint'),
+                emptyText: gettext(
+                    "Server certificate's SHA-256 fingerprint, required for self-signed certificates",
+                ),
+                cbind: {
+                    deleteEmpty: '{!isCreate}',
+                },
+            },
+        ],
+
+        advancedColumn1: [
+            {
+                xtype: 'pmxBandwidthField',
+                name: 'rate-in',
+                fieldLabel: gettext('Rate In'),
+                emptyText: gettext('Unlimited'),
+                submitAutoScaledSizeUnit: true,
+            },
+            {
+                xtype: 'pmxBandwidthField',
+                name: 'rate-out',
+                fieldLabel: gettext('Rate Out'),
+                emptyText: gettext('Unlimited'),
+                submitAutoScaledSizeUnit: true,
+            },
+            {
+                xtype: 'proxmoxintegerfield',
+                name: 'limit-active-requests',
+                fieldLabel: gettext('PUT/POST/DELETE request limit (#/s)'),
+                emptyText: gettext('Unlimited'),
+                minValue: 1,
+            },
+            {
+                xtype: 'proxmoxcheckbox',
+                fieldLabel: gettext('Use node proxy'),
+                name: 'use-node-proxy',
+                autoEl: {
+                    tag: 'div',
+                    'data-qtip': gettext(
+                        "Use the node's http proxy configuration for S3 client API connections.",
+                    ),
+                },
+                uncheckedValue: false,
+                value: false,
+            },
+        ],
+        advancedColumn2: [
+            {
+                xtype: 'pmxBandwidthField',
+                name: 'burst-in',
+                fieldLabel: gettext('Burst In'),
+                emptyText: gettext('Same as Rate'),
+                submitAutoScaledSizeUnit: true,
+            },
+            {
+                xtype: 'pmxBandwidthField',
+                name: 'burst-out',
+                fieldLabel: gettext('Burst Out'),
+                emptyText: gettext('Same as Rate'),
+                submitAutoScaledSizeUnit: true,
+            },
+            {
+                xtype: 'proxmoxintegerfield',
+                name: 'limit-passive-requests',
+                fieldLabel: gettext('GET/HEAD request limit (#/s)'),
+                emptyText: gettext('Unlimited'),
+                minValue: 1,
+            },
+        ],
+        advancedColumnB: [
+            {
+                xtype: 'fieldset',
+                name: 'provider-quirks',
+                fieldLabel: gettext('Provider Quirks'),
+                items: [
+                    {
+                        xtype: 'checkbox',
+                        name: 'skip-if-none-match-header',
+                        fieldLabel: gettext('Skip If-None-Match header'),
+                        labelWidth: 200,
+                    },
+                    {
+                        xtype: 'checkbox',
+                        name: 'delete-objects-via-delete-object',
+                        fieldLabel: gettext('DeleteObjects via deleteObject'),
+                        labelWidth: 200,
+                    },
+                ],
+            },
+        ],
+    },
+
+    getValues: function () {
+        let me = this;
+        let values = me.callParent(arguments);
+
+        PBS.Utils.delete_if_default(values, 'path-style', false, me.isCreate);
+        PBS.Utils.delete_if_default(values, 'rate-in', undefined, me.isCreate);
+        PBS.Utils.delete_if_default(values, 'burst-in', undefined, me.isCreate);
+        PBS.Utils.delete_if_default(values, 'rate-out', undefined, me.isCreate);
+        PBS.Utils.delete_if_default(values, 'burst-out', undefined, me.isCreate);
+
+        let https_scheme_prefix = 'https://';
+        if (values.endpoint.startsWith(https_scheme_prefix)) {
+            values.endpoint = values.endpoint.slice(https_scheme_prefix.length);
+        }
+        if (values['access-key'] === '') {
+            delete values['access-key'];
+        }
+
+        if (values['secret-key'] === '') {
+            delete values['secret-key'];
+        }
+
+        let quirks = [];
+        ['skip-if-none-match-header', 'delete-objects-via-delete-object'].forEach((quirk) => {
+            if (values[quirk]) {
+                quirks.push(quirk);
+                delete values[quirk];
+            }
+        });
+
+        if (quirks.length > 0) {
+            values['provider-quirks'] = quirks;
+        } else if (!me.isCreate) {
+            values.delete.push('provider-quirks');
+        }
+
+        return values;
+    },
+
+    setValues: function (values) {
+        if (values['provider-quirks']) {
+            values['provider-quirks'].forEach((quirk) => (values[quirk] = true));
+        }
+
+        this.callParent(arguments);
+    },
+});

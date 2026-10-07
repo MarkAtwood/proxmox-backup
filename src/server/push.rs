@@ -1,0 +1,1647 @@
+//! Sync datastore by pushing contents to remote server
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Error, bail, format_err};
+use futures::stream::{self, StreamExt, TryStreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{Level, info, warn};
+
+use pbs_api_types::{
+    ApiVersion, ApiVersionInfo, ArchiveType, Authid, BackupArchiveName, BackupDir, BackupGroup,
+    BackupGroupDeleteStats, BackupNamespace, CLIENT_LOG_BLOB_NAME, CryptMode, GroupFilter,
+    GroupListItem, MANIFEST_BLOB_NAME, NamespaceListItem, Operation, PRIV_DATASTORE_BACKUP,
+    PRIV_DATASTORE_READ, PRIV_REMOTE_DATASTORE_BACKUP, PRIV_REMOTE_DATASTORE_MODIFY,
+    PRIV_REMOTE_DATASTORE_PRUNE, RateLimitConfig, Remote, SnapshotListItem, print_store_and_ns,
+};
+use pbs_client::{
+    BackupRepository, BackupStats, BackupWriter, BackupWriterOptions, HttpClient, IndexType,
+    MergedChunkInfo, UploadOptions,
+};
+use pbs_config::CachedUserInfo;
+use pbs_datastore::data_blob::{ChunkInfo, DataChunkBuilder};
+use pbs_datastore::dynamic_index::DynamicIndexReader;
+use pbs_datastore::fixed_index::FixedIndexReader;
+use pbs_datastore::index::IndexFile;
+use pbs_datastore::read_chunk::AsyncReadChunk;
+use pbs_datastore::{
+    BackupManifest, DataBlob, DataStore, StoreProgress, check_namespace_depth_limit,
+};
+use pbs_tools::bounded_join_set::BoundedJoinSet;
+use pbs_tools::buffered_logger::{BufferedLogger, LogLineSender};
+use pbs_tools::crypt_config::CryptConfig;
+
+use proxmox_human_byte::HumanByte;
+
+use super::sync::{
+    LocalSource, RemovedVanishedStats, SkipInfo, SkipReason, SyncSource, SyncStats,
+    exclude_not_verified_or_encrypted, filter_out_in_progress, ignore_not_verified_or_encrypted,
+};
+use crate::api2::config::remote;
+use crate::server::sync::SharedGroupProgress;
+
+#[cfg(test)]
+mod tests;
+
+/// Target for backups to be pushed to
+pub(crate) struct PushTarget {
+    // Remote as found in remote.cfg
+    remote: Remote,
+    // Target repository on remote
+    repo: BackupRepository,
+    // Target namespace on remote
+    ns: BackupNamespace,
+    // Http client to connect to remote
+    client: HttpClient,
+    // Remote target api supports prune delete stats
+    supports_prune_delete_stats: bool,
+}
+
+impl PushTarget {
+    fn remote_user(&self) -> Authid {
+        self.remote.config.auth_id.clone()
+    }
+
+    fn datastore_api_path(&self, endpoint: &str) -> String {
+        format!(
+            "api2/json/admin/datastore/{store}/{endpoint}",
+            store = self.repo.store()
+        )
+    }
+}
+
+/// Parameters for a push operation
+pub(crate) struct PushParameters {
+    /// Source of backups to be pushed to remote
+    source: Arc<LocalSource>,
+    /// Target for backups to be pushed to
+    target: PushTarget,
+    /// User used for permission checks on the source side, including potentially filtering visible
+    /// namespaces and backup groups.
+    local_user: Authid,
+    /// Whether to remove groups and namespaces which exist locally, but not on the remote end
+    remove_vanished: bool,
+    /// How many levels of sub-namespaces to push (0 == no recursion, None == maximum recursion)
+    max_depth: Option<usize>,
+    /// Filters for reducing the push scope
+    group_filter: Vec<GroupFilter>,
+    /// Synchronize only encrypted backup snapshots
+    encrypted_only: bool,
+    /// Synchronize only verified backup snapshots
+    verified_only: bool,
+    /// How many snapshots should be transferred at most (taking the newest N snapshots)
+    transfer_last: Option<usize>,
+    /// Maximum number of worker threads for push during sync job
+    worker_threads: Option<usize>,
+    /// Encryption key to use for pushing unencrypted backup snapshots. Does not affect
+    /// already encrypted snapshots.
+    crypt_config: Option<(String, Arc<CryptConfig>)>,
+}
+
+impl PushParameters {
+    /// Creates a new instance of `PushParameters`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new(
+        store: &str,
+        ns: BackupNamespace,
+        remote_id: &str,
+        remote_store: &str,
+        remote_ns: BackupNamespace,
+        local_user: Authid,
+        remove_vanished: Option<bool>,
+        max_depth: Option<usize>,
+        group_filter: Option<Vec<GroupFilter>>,
+        encrypted_only: Option<bool>,
+        verified_only: Option<bool>,
+        limit: RateLimitConfig,
+        transfer_last: Option<usize>,
+        worker_threads: Option<usize>,
+        active_encryption_key: Option<String>,
+    ) -> Result<Self, Error> {
+        if let Some(max_depth) = max_depth {
+            ns.check_max_depth(max_depth)?;
+            remote_ns.check_max_depth(max_depth)?;
+        };
+        let remove_vanished = remove_vanished.unwrap_or(false);
+        let encrypted_only = encrypted_only.unwrap_or(false);
+        let verified_only = verified_only.unwrap_or(false);
+        let lookup = crate::tools::lookup_with(store, Operation::Read);
+        let store = DataStore::lookup_datastore(lookup)?;
+
+        if !store.namespace_exists(&ns) {
+            bail!(
+                "Source namespace '{ns}' doesn't exist in datastore '{store}'!",
+                store = store.name()
+            );
+        }
+
+        let source = Arc::new(LocalSource { store, ns });
+
+        let (remote_config, _digest) = pbs_config::remote::config()?;
+        let remote: Remote = remote_config.lookup("remote", remote_id)?;
+
+        let repo = BackupRepository::new(
+            Some(remote.config.auth_id.clone()),
+            Some(remote.config.host.clone()),
+            remote.config.port,
+            remote_store.to_string(),
+        );
+
+        let client = remote::remote_client_config(&remote, Some(limit))?;
+
+        let mut result = client.get("api2/json/version", None).await?;
+        let data = result["data"].take();
+        let version_info: ApiVersionInfo = serde_json::from_value(data)?;
+        let api_version = ApiVersion::try_from(version_info)?;
+
+        // push assumes namespace support on the remote side, fail early if missing
+        if api_version < ApiVersion::new(2, 2, 0) {
+            bail!("Unsupported remote api version, minimum v2.2 required");
+        }
+
+        let supports_prune_delete_stats = api_version >= ApiVersion::new(3, 2, 11);
+
+        let target = PushTarget {
+            remote,
+            repo,
+            ns: remote_ns,
+            client,
+            supports_prune_delete_stats,
+        };
+        let group_filter = group_filter.unwrap_or_default();
+
+        let crypt_config = if let Some(key_id) = &active_encryption_key {
+            let crypt_config =
+                crate::server::sync::check_privs_and_load_key_config(key_id, &local_user, true)?;
+            Some((key_id.to_string(), crypt_config))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            source,
+            target,
+            local_user,
+            remove_vanished,
+            max_depth,
+            group_filter,
+            encrypted_only,
+            verified_only,
+            transfer_last,
+            worker_threads,
+            crypt_config,
+        })
+    }
+
+    // Map the given namespace from source to target by adapting the prefix
+    fn map_to_target(&self, namespace: &BackupNamespace) -> Result<BackupNamespace, Error> {
+        namespace.map_prefix(&self.source.ns, &self.target.ns)
+    }
+}
+
+// Check if the job user given in the push parameters has the provided privs on the remote
+// datastore namespace
+fn check_ns_remote_datastore_privs(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+    privs: u64,
+) -> Result<(), Error> {
+    let user_info = CachedUserInfo::new()?;
+    let acl_path =
+        target_namespace.remote_acl_path(&params.target.remote.name, params.target.repo.store());
+
+    user_info.check_privs(&params.local_user, &acl_path, privs, false)?;
+
+    Ok(())
+}
+
+// Fetch the list of namespaces found on target
+async fn fetch_target_namespaces(params: &PushParameters) -> Result<Vec<BackupNamespace>, Error> {
+    let api_path = params.target.datastore_api_path("namespace");
+    let mut result = params
+        .target
+        .client
+        .get(&api_path, None)
+        .await
+        .context("Fetching remote namespaces failed, remote returned error")?;
+    let namespaces: Vec<NamespaceListItem> = serde_json::from_value(result["data"].take())?;
+    let mut namespaces: Vec<BackupNamespace> = namespaces
+        .into_iter()
+        .map(|namespace| namespace.ns)
+        .collect();
+    namespaces.sort_unstable_by_key(|a| a.name_len());
+
+    Ok(namespaces)
+}
+
+// Remove the provided namespace from the target
+async fn remove_target_namespace(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+) -> Result<BackupGroupDeleteStats, Error> {
+    if target_namespace.is_root() {
+        bail!("Cannot remove root namespace from remote");
+    }
+
+    check_ns_remote_datastore_privs(params, target_namespace, PRIV_REMOTE_DATASTORE_MODIFY)
+        .context("Pruning remote datastore namespaces not allowed")?;
+
+    let api_path = params.target.datastore_api_path("namespace");
+
+    let mut args = serde_json::json!({
+        "ns": target_namespace.name(),
+        "delete-groups": true,
+    });
+
+    if params.target.supports_prune_delete_stats {
+        args["error-on-protected"] = serde_json::to_value(false)?;
+    }
+
+    let mut result = params
+        .target
+        .client
+        .delete(&api_path, Some(args))
+        .await
+        .context(format!(
+            "Failed to remove remote namespace {target_namespace}, remote returned error"
+        ))?;
+
+    if params.target.supports_prune_delete_stats {
+        Ok(serde_json::from_value(result["data"].take())?)
+    } else {
+        Ok(BackupGroupDeleteStats::default())
+    }
+}
+
+// Fetch the list of groups found on target in given namespace
+// Returns sorted list of owned groups and a hashset containing not owned backup groups on target.
+async fn fetch_target_groups(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+) -> Result<(Vec<BackupGroup>, HashSet<BackupGroup>), Error> {
+    let api_path = params.target.datastore_api_path("groups");
+    let args = Some(serde_json::json!({ "ns": target_namespace.name() }));
+
+    let mut result = params
+        .target
+        .client
+        .get(&api_path, args)
+        .await
+        .context("Failed to fetch remote groups, remote returned error")?;
+
+    let groups: Vec<GroupListItem> = serde_json::from_value(result["data"].take())?;
+
+    let (mut owned, not_owned) = groups.into_iter().fold(
+        (Vec::new(), HashSet::new()),
+        |(mut owned, mut not_owned), group| {
+            if Some(params.target.remote_user()) == group.owner {
+                owned.push(group.backup);
+            } else {
+                not_owned.insert(group.backup);
+            }
+            (owned, not_owned)
+        },
+    );
+
+    owned.sort_unstable();
+
+    Ok((owned, not_owned))
+}
+
+// Remove the provided backup group in given namespace from the target
+async fn remove_target_group(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+    backup_group: &BackupGroup,
+) -> Result<BackupGroupDeleteStats, Error> {
+    check_ns_remote_datastore_privs(params, target_namespace, PRIV_REMOTE_DATASTORE_PRUNE)
+        .context("Pruning remote datastore contents not allowed")?;
+
+    let api_path = params.target.datastore_api_path("groups");
+
+    let mut args = serde_json::json!(backup_group);
+    args["ns"] = serde_json::to_value(target_namespace.name())?;
+
+    if params.target.supports_prune_delete_stats {
+        args["error-on-protected"] = serde_json::to_value(false)?;
+    }
+
+    let mut result = params
+        .target
+        .client
+        .delete(&api_path, Some(args))
+        .await
+        .context(format!(
+            "Failed to remove remote group {backup_group}, remote returned error"
+        ))?;
+
+    if params.target.supports_prune_delete_stats {
+        Ok(serde_json::from_value(result["data"].take())?)
+    } else {
+        Ok(BackupGroupDeleteStats::default())
+    }
+}
+
+// Check if the namespace is already present on the target, create it otherwise
+async fn check_or_create_target_namespace(
+    params: &PushParameters,
+    existing_target_namespaces: &mut Vec<BackupNamespace>,
+    target_namespace: &BackupNamespace,
+) -> Result<(), Error> {
+    if !target_namespace.is_root() && !existing_target_namespaces.contains(target_namespace) {
+        // Namespace not present on target, create namespace.
+        // Sub-namespaces have to be created by creating parent components first.
+
+        check_ns_remote_datastore_privs(params, target_namespace, PRIV_REMOTE_DATASTORE_MODIFY)
+            .context("Creating remote namespace not allowed")?;
+
+        let mut parent = BackupNamespace::root();
+        for component in target_namespace.components() {
+            let current = BackupNamespace::from_parent_ns(&parent, component.to_string())?;
+            // Skip over pre-existing parent namespaces on target
+            if existing_target_namespaces.contains(&current) {
+                parent = current;
+                continue;
+            }
+            let api_path = params.target.datastore_api_path("namespace");
+            let mut args = serde_json::json!({ "name": component.to_string() });
+            if !parent.is_root() {
+                args["parent"] = serde_json::to_value(parent.clone())?;
+            }
+
+            params
+                .target
+                .client
+                .post(&api_path, Some(args))
+                .await
+                .context(format!(
+                    "Creation of remote namespace {current} failed, remote returned error"
+                ))?;
+
+            info!("Successfully created new namespace {current} on remote");
+
+            existing_target_namespaces.push(current.clone());
+            parent = current;
+        }
+    }
+
+    Ok(())
+}
+
+/// Push contents of source datastore matched by given push parameters to target.
+pub(crate) async fn push_store(mut params: PushParameters) -> Result<SyncStats, Error> {
+    let mut errors = false;
+
+    let user_info = CachedUserInfo::new()?;
+    let store = params.source.get_store().to_owned();
+    let auth_id = params.local_user.clone();
+    // Generate list of source namespaces to push to target, limited by max-depth and filtered
+    // by local user access privs.
+    let ns_access_filter = Box::new(move |namespace: &BackupNamespace| {
+        let acl_path = namespace.acl_path(&store);
+        let privs = PRIV_DATASTORE_READ | PRIV_DATASTORE_BACKUP;
+        user_info
+            .check_privs(&auth_id, &acl_path, privs, true)
+            .is_ok()
+    });
+    let mut source_namespaces = params
+        .source
+        .list_namespaces(&mut params.max_depth, ns_access_filter)
+        .await?;
+
+    check_namespace_depth_limit(
+        &params.source.get_ns(),
+        &params.target.ns,
+        &source_namespaces,
+    )?;
+
+    source_namespaces.sort_unstable_by_key(|a| a.name_len());
+
+    // Fetch all accessible namespaces already present on the target
+    let mut existing_target_namespaces = fetch_target_namespaces(&params)
+        .await
+        .map_err(|err| format_err!("{err:#}"))?;
+    // Remember synced namespaces, removing non-synced ones when remove vanished flag is set
+    let mut synced_namespaces = HashSet::with_capacity(source_namespaces.len());
+
+    let (mut groups, mut snapshots) = (0, 0);
+    let mut stats = SyncStats::default();
+    let params = Arc::new(params);
+    for source_namespace in &source_namespaces {
+        let source_store_and_ns = print_store_and_ns(params.source.store.name(), source_namespace);
+        let target_namespace = params.map_to_target(source_namespace)?;
+        let target_store_and_ns = print_store_and_ns(params.target.repo.store(), &target_namespace);
+
+        info!("----");
+        info!("Syncing {source_store_and_ns} into {target_store_and_ns}");
+
+        synced_namespaces.insert(target_namespace.clone());
+
+        if let Err(err) = check_or_create_target_namespace(
+            &params,
+            &mut existing_target_namespaces,
+            &target_namespace,
+        )
+        .await
+        {
+            warn!("Encountered error: {err:#}");
+            warn!("Failed to sync {source_store_and_ns} into {target_store_and_ns}!");
+            errors = true;
+            continue;
+        }
+
+        match push_namespace(source_namespace, Arc::clone(&params)).await {
+            Ok((sync_progress, sync_stats, sync_errors)) => {
+                errors |= sync_errors;
+                stats.add(sync_stats);
+
+                if params.max_depth != Some(0) {
+                    groups += sync_progress.done_groups;
+                    snapshots += sync_progress.done_snapshots;
+
+                    let ns = if source_namespace.is_root() {
+                        "root namespace".into()
+                    } else {
+                        format!("namespace {source_namespace}")
+                    };
+                    info!(
+                        "Finished syncing {ns}, current progress: {groups} groups, {snapshots} snapshots"
+                    );
+                }
+            }
+            Err(err) => {
+                errors = true;
+                info!("Encountered errors: {err:#}");
+                info!("Failed to sync {source_store_and_ns} into {target_store_and_ns}!");
+            }
+        }
+    }
+
+    if params.remove_vanished {
+        // Attention: Filter out all namespaces which are not sub-namespaces of the sync target
+        // namespace, or not included in the sync because of the depth limit.
+        // Without this pre-filtering, all namespaces unrelated to the sync would be removed!
+        let max_depth = params
+            .max_depth
+            .unwrap_or(pbs_api_types::MAX_NAMESPACE_DEPTH);
+        let mut target_sub_namespaces: Vec<BackupNamespace> = existing_target_namespaces
+            .into_iter()
+            .filter(|target_namespace| {
+                params
+                    .target
+                    .ns
+                    .contains(target_namespace)
+                    .map(|sub_depth| sub_depth <= max_depth)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // Sort by namespace length and revert for sub-namespaces to be removed before parents
+        target_sub_namespaces.sort_unstable_by_key(|a| a.name_len());
+        target_sub_namespaces.reverse();
+
+        for target_namespace in target_sub_namespaces {
+            if synced_namespaces.contains(&target_namespace) {
+                continue;
+            }
+            match remove_target_namespace(&params, &target_namespace).await {
+                Ok(delete_stats) => {
+                    stats.add(SyncStats::from(RemovedVanishedStats {
+                        snapshots: delete_stats.removed_snapshots(),
+                        groups: delete_stats.removed_groups(),
+                        namespaces: 1,
+                    }));
+                    if delete_stats.protected_snapshots() > 0 {
+                        warn!(
+                            "Kept {protected_count} protected snapshots of remote namespace {target_namespace}",
+                            protected_count = delete_stats.protected_snapshots(),
+                        );
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    warn!("Encountered errors: {err:#}");
+                    warn!("Failed to remove vanished namespace {target_namespace} from remote!");
+                    continue;
+                }
+            }
+            info!("Successfully removed vanished namespace {target_namespace} from remote");
+        }
+
+        if !params.target.supports_prune_delete_stats {
+            info!("Older api version on remote detected, deletion statistics might be incomplete");
+        }
+    }
+
+    if errors {
+        bail!("Sync failed with some errors!");
+    }
+
+    Ok(stats)
+}
+
+/// Push namespace including all backup groups to target
+///
+/// Iterate over all backup groups in the namespace and push them to the target.
+pub(crate) async fn push_namespace(
+    namespace: &BackupNamespace,
+    params: Arc<PushParameters>,
+) -> Result<(StoreProgress, SyncStats, bool), Error> {
+    let target_namespace = params.map_to_target(namespace)?;
+    // Check if user is allowed to perform backups on remote datastore
+    check_ns_remote_datastore_privs(&params, &target_namespace, PRIV_REMOTE_DATASTORE_BACKUP)
+        .context("Pushing to remote namespace not allowed")?;
+
+    let mut list: Vec<BackupGroup> = params
+        .source
+        .list_groups(namespace, &params.local_user)
+        .await?;
+
+    list.sort_unstable();
+
+    let total = list.len();
+    let list: Vec<BackupGroup> = list
+        .into_iter()
+        .filter(|group| group.apply_filters(&params.group_filter))
+        .collect();
+
+    info!(
+        "Found {filtered} groups to sync (out of {total} total)",
+        filtered = list.len()
+    );
+
+    let mut errors = false;
+    // Remember synced groups, remove others when the remove vanished flag is set
+    let synced_groups = Arc::new(Mutex::new(HashSet::new()));
+    let mut progress = StoreProgress::new(list.len() as u64);
+    let mut stats = SyncStats::default();
+
+    let (owned_target_groups, not_owned_target_groups) =
+        fetch_target_groups(&params, &target_namespace).await?;
+    let not_owned_target_groups = Arc::new(not_owned_target_groups);
+
+    let mut group_workers = BoundedJoinSet::new(params.worker_threads.unwrap_or(1));
+    let shared_group_progress = Arc::new(SharedGroupProgress::with_total_groups(list.len()));
+
+    let (buffered_lines, max_duration) = if params.worker_threads.unwrap_or(1) > 1 {
+        (5, Duration::from_secs(1))
+    } else {
+        (0, Duration::ZERO)
+    };
+    let sender_builder = BufferedLogger::new(buffered_lines, max_duration);
+
+    let mut process_results = |results| {
+        for result in results {
+            progress.done_groups = shared_group_progress.increment_done();
+
+            match result {
+                Ok(sync_stats) => {
+                    stats.add(sync_stats);
+                }
+                Err(_err) => errors = true,
+            }
+        }
+    };
+
+    for group in list.into_iter() {
+        let namespace = namespace.clone();
+        let params = Arc::clone(&params);
+        let not_owned_target_groups = Arc::clone(&not_owned_target_groups);
+        let synced_groups = Arc::clone(&synced_groups);
+        let group_progress_cloned = Arc::clone(&shared_group_progress);
+        let log_sender: Arc<LogLineSender> =
+            Arc::new(sender_builder.sender_with_label(group.to_string()));
+        let results = group_workers
+            .spawn_task(async move {
+                let result = push_group_do(
+                    params,
+                    &namespace,
+                    &group,
+                    group_progress_cloned,
+                    synced_groups,
+                    not_owned_target_groups,
+                    Arc::clone(&log_sender),
+                )
+                .await;
+                let _ = log_sender.flush().await;
+                result
+            })
+            .await
+            .map_err(|err| format_err!("failed to join on worker task: {err:#}"))?;
+        process_results(results);
+    }
+
+    while let Some(result) = group_workers.join_next().await {
+        let result = result.map_err(|err| format_err!("failed to join on worker task: {err:#}"))?;
+        process_results(vec![result]);
+    }
+
+    // Force flush of pending messages
+    sender_builder.close().await?;
+
+    if params.remove_vanished {
+        // only ever allow to prune owned groups on target
+        for target_group in owned_target_groups {
+            if synced_groups.lock().unwrap().contains(&target_group) {
+                continue;
+            }
+            if !target_group.apply_filters(&params.group_filter) {
+                continue;
+            }
+
+            match remove_target_group(&params, &target_namespace, &target_group).await {
+                Ok(delete_stats) => {
+                    info!("Removed vanished group {target_group} from remote");
+                    if delete_stats.protected_snapshots() > 0 {
+                        warn!(
+                            "Kept {protected_count} protected snapshots of group {target_group} on remote",
+                            protected_count = delete_stats.protected_snapshots(),
+                        );
+                    }
+                    stats.add(SyncStats::from(RemovedVanishedStats {
+                        snapshots: delete_stats.removed_snapshots(),
+                        groups: delete_stats.removed_groups(),
+                        namespaces: 0,
+                    }));
+                }
+                Err(err) => {
+                    warn!("Encountered errors: {err:#}");
+                    warn!("Failed to remove vanished group {target_group} from remote!");
+                    errors = true;
+                    continue;
+                }
+            }
+        }
+    }
+
+    Ok((progress, stats, errors))
+}
+
+async fn fetch_target_snapshots(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+    group: &BackupGroup,
+) -> Result<Vec<SnapshotListItem>, Error> {
+    let api_path = params.target.datastore_api_path("snapshots");
+    let mut args = serde_json::to_value(group)?;
+    if !target_namespace.is_root() {
+        args["ns"] = serde_json::to_value(target_namespace)?;
+    }
+    let mut result = params
+        .target
+        .client
+        .get(&api_path, Some(args))
+        .await
+        .context("Failed to fetch remote snapshots, remote returned error")?;
+    let snapshots: Vec<SnapshotListItem> = serde_json::from_value(result["data"].take())?;
+
+    Ok(snapshots)
+}
+
+async fn forget_target_snapshot(
+    params: &PushParameters,
+    target_namespace: &BackupNamespace,
+    snapshot: &BackupDir,
+) -> Result<(), Error> {
+    check_ns_remote_datastore_privs(params, target_namespace, PRIV_REMOTE_DATASTORE_PRUNE)
+        .context("Pruning remote datastore contents not allowed")?;
+
+    let api_path = params.target.datastore_api_path("snapshots");
+    let mut args = serde_json::to_value(snapshot)?;
+    if !target_namespace.is_root() {
+        args["ns"] = serde_json::to_value(target_namespace)?;
+    }
+    params
+        .target
+        .client
+        .delete(&api_path, Some(args))
+        .await
+        .context("Failed to remove remote snapshot, remote returned error")?;
+
+    Ok(())
+}
+
+async fn push_group_do(
+    params: Arc<PushParameters>,
+    namespace: &BackupNamespace,
+    group: &BackupGroup,
+    shared_group_progress: Arc<SharedGroupProgress>,
+    synced_groups: Arc<Mutex<HashSet<BackupGroup>>>,
+    not_owned_target_groups: Arc<HashSet<BackupGroup>>,
+    log_sender: Arc<LogLineSender>,
+) -> Result<SyncStats, Error> {
+    if not_owned_target_groups.contains(group) {
+        log_sender
+            .log(
+                Level::WARN,
+                format!(
+                    "Group '{group}' not owned by remote user '{}' on target, skipping upload",
+                    params.target.remote_user(),
+                ),
+            )
+            .await?;
+        return Ok(SyncStats::default());
+    }
+
+    synced_groups.lock().unwrap().insert(group.clone());
+    match push_group(
+        params,
+        namespace,
+        group,
+        Arc::clone(&shared_group_progress),
+        Arc::clone(&log_sender),
+    )
+    .await
+    {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            log_sender
+                .log(Level::WARN, format!("Encountered errors: {err:#}"))
+                .await?;
+            log_sender
+                .log(
+                    Level::WARN,
+                    format!("Failed to push group {group} to remote!"),
+                )
+                .await?;
+            Err(err)
+        }
+    }
+}
+
+/// Push group including all snaphshots to target
+///
+/// Iterate over all snapshots in the group and push them to the target.
+/// The group sync operation consists of the following steps:
+/// - Query snapshots of given group from the source
+/// - Sort snapshots by time
+/// - Apply transfer last cutoff and filters to list
+/// - Iterate the snapshot list and push each snapshot individually
+/// - (Optional): Remove vanished groups if `remove_vanished` flag is set
+pub(crate) async fn push_group(
+    params: Arc<PushParameters>,
+    namespace: &BackupNamespace,
+    group: &BackupGroup,
+    shared_group_progress: Arc<SharedGroupProgress>,
+    log_sender: Arc<LogLineSender>,
+) -> Result<SyncStats, Error> {
+    let mut already_synced_skip_info = SkipInfo::new(SkipReason::AlreadySynced);
+    let mut transfer_last_skip_info = SkipInfo::new(SkipReason::TransferLast);
+
+    let mut snapshots: Vec<SnapshotListItem> = params
+        .source
+        .list_backup_snapshots(namespace, group)
+        .await?;
+    snapshots = filter_out_in_progress(snapshots, Arc::clone(&log_sender)).await?;
+    snapshots.sort_unstable_by_key(|a| a.backup.time);
+
+    if snapshots.is_empty() {
+        log_sender
+            .log(
+                Level::INFO,
+                format!("Group '{group}' contains no snapshots to sync to remote"),
+            )
+            .await?;
+    }
+
+    let target_namespace = params.map_to_target(namespace)?;
+    let mut target_snapshots = fetch_target_snapshots(&params, &target_namespace, group).await?;
+    target_snapshots.sort_unstable_by_key(|a| a.backup.time);
+
+    let last_snapshot_time = target_snapshots
+        .last()
+        .map(|snapshot| snapshot.backup.time)
+        .unwrap_or(i64::MIN);
+
+    let mut source_snapshots = HashSet::new();
+    let snapshots: Vec<BackupDir> = snapshots
+        .into_iter()
+        .filter_map(|item| {
+            if exclude_not_verified_or_encrypted(&item, params.verified_only, params.encrypted_only)
+            {
+                return None;
+            }
+            Some(item.backup)
+        })
+        .collect();
+
+    let total_snapshots = snapshots.len();
+    let cutoff = params
+        .transfer_last
+        .map(|count| total_snapshots.saturating_sub(count))
+        .unwrap_or_default();
+
+    let snapshots: Vec<BackupDir> = snapshots
+        .into_iter()
+        .enumerate()
+        .filter_map(|(pos, snapshot)| {
+            source_snapshots.insert(snapshot.time);
+            if last_snapshot_time >= snapshot.time {
+                already_synced_skip_info.update(snapshot.time);
+                return None;
+            }
+            if pos < cutoff {
+                transfer_last_skip_info.update(snapshot.time);
+                return None;
+            }
+            Some(snapshot)
+        })
+        .collect();
+
+    if already_synced_skip_info.count > 0 {
+        log_sender
+            .log(Level::INFO, already_synced_skip_info.to_string())
+            .await?;
+        already_synced_skip_info.reset();
+    }
+    if transfer_last_skip_info.count > 0 {
+        log_sender
+            .log(Level::INFO, transfer_last_skip_info.to_string())
+            .await?;
+        transfer_last_skip_info.reset();
+    }
+
+    let mut local_progress = StoreProgress::new(shared_group_progress.total_groups());
+    local_progress.group_snapshots = snapshots.len() as u64;
+
+    let mut stats = SyncStats::default();
+    let mut fetch_previous_manifest = !target_snapshots.is_empty();
+    for (pos, source_snapshot) in snapshots.into_iter().enumerate() {
+        let prefix = proxmox_time::epoch_to_rfc3339_utc(source_snapshot.time)
+            .context("invalid timestamp")?;
+        log_sender
+            .log(Level::INFO, format!("{prefix}: start sync"))
+            .await?;
+        let result = push_snapshot(
+            &params,
+            namespace,
+            &source_snapshot,
+            fetch_previous_manifest,
+            Arc::clone(&log_sender),
+            &prefix,
+        )
+        .await;
+        fetch_previous_manifest = true;
+
+        // Update done groups progress by other parallel running pushes
+        local_progress.done_groups = shared_group_progress.load_done();
+        local_progress.done_snapshots = pos as u64 + 1;
+
+        // stop on error
+        let sync_stats = result?;
+        log_sender
+            .log(Level::INFO, format!("{prefix}: sync done"))
+            .await?;
+        if params.worker_threads.unwrap_or(1) == 1 {
+            log_sender
+                .log(Level::INFO, format!("percentage done: {local_progress}"))
+                .await?;
+        } else {
+            log_sender
+                .log(
+                    Level::INFO,
+                    format!(
+                        "snapshot {}/{} within {group} is done, {}/{} groups done",
+                        local_progress.done_snapshots,
+                        local_progress.group_snapshots,
+                        local_progress.done_groups,
+                        local_progress.total_groups,
+                    ),
+                )
+                .await?;
+        }
+        stats.add(sync_stats);
+    }
+
+    if params.remove_vanished {
+        for snapshot in target_snapshots {
+            if source_snapshots.contains(&snapshot.backup.time) {
+                continue;
+            }
+            if snapshot.protected {
+                log_sender
+                    .log(
+                        Level::INFO,
+                        format!(
+                            "Kept protected snapshot {name} on remote",
+                            name = snapshot.backup
+                        ),
+                    )
+                    .await?;
+                continue;
+            }
+            match forget_target_snapshot(&params, &target_namespace, &snapshot.backup).await {
+                Ok(()) => {
+                    log_sender
+                        .log(
+                            Level::INFO,
+                            format!(
+                                "Removed vanished snapshot {name} from remote",
+                                name = snapshot.backup
+                            ),
+                        )
+                        .await?;
+                }
+                Err(err) => {
+                    log_sender
+                        .log(Level::WARN, format!("Encountered errors: {err:#}"))
+                        .await?;
+                    log_sender
+                        .log(
+                            Level::WARN,
+                            format!(
+                                "Failed to remove vanished snapshot {name} from remote!",
+                                name = snapshot.backup
+                            ),
+                        )
+                        .await?;
+                }
+            }
+            stats.add(SyncStats::from(RemovedVanishedStats {
+                snapshots: 1,
+                groups: 0,
+                namespaces: 0,
+            }));
+        }
+    }
+
+    if params.worker_threads.unwrap_or(1) > 1 {
+        log_sender
+            .log(
+                Level::INFO,
+                format!("group sync done: percentage done: {local_progress}"),
+            )
+            .await?;
+    }
+
+    Ok(stats)
+}
+
+fn check_previous_chunk_modes(
+    previous: &BackupManifest,
+    source: &BackupManifest,
+    encrypt: bool,
+) -> Result<(), Error> {
+    for file in source.files() {
+        if file.filename.archive_type() == ArchiveType::Blob {
+            continue;
+        }
+        let Ok(previous_file) = previous.lookup_file_info(&file.filename) else {
+            continue;
+        };
+        let target_mode = if encrypt {
+            CryptMode::Encrypt
+        } else {
+            file.chunk_crypt_mode()
+        };
+        if previous_file.chunk_crypt_mode() != target_mode {
+            bail!(
+                "previous archive '{}' has a different chunk encryption mode; \
+                 switching between encrypted and unencrypted backups requires uploading the data",
+                file.filename,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_previous_snapshot_known_chunks(
+    upload_options: &UploadOptions,
+    backup_writer: &BackupWriter,
+    archive_name: &BackupArchiveName,
+    known_chunks: Arc<Mutex<HashSet<[u8; 32]>>>,
+) {
+    if let Some(manifest) = upload_options.previous_manifest.as_ref() {
+        // Add known chunks, ignore errors since archive might not be present and it is better
+        // to proceed on unrelated errors than to fail here.
+        match archive_name.archive_type() {
+            ArchiveType::FixedIndex => {
+                let _res = backup_writer
+                    .download_previous_fixed_index(archive_name, manifest, known_chunks)
+                    .await;
+            }
+            ArchiveType::DynamicIndex => {
+                let _res = backup_writer
+                    .download_previous_dynamic_index(archive_name, manifest, known_chunks)
+                    .await;
+            }
+            ArchiveType::Blob => (),
+        };
+    }
+}
+
+/// Push snapshot to target
+///
+/// Creates a new snapshot on the target and pushes the content of the source snapshot to the
+/// target by creating a new manifest file and connecting to the remote as backup writer client.
+/// Chunks are written by recreating the index by uploading the chunk stream as read from the
+/// source. Data blobs are uploaded as such.
+pub(crate) async fn push_snapshot(
+    params: &PushParameters,
+    namespace: &BackupNamespace,
+    snapshot: &BackupDir,
+    fetch_previous_manifest: bool,
+    log_sender: Arc<LogLineSender>,
+    prefix: &str,
+) -> Result<SyncStats, Error> {
+    let mut stats = SyncStats::default();
+    let target_ns = params
+        .map_to_target(namespace)
+        .with_context(|| prefix.to_string())?;
+    let backup_dir = params
+        .source
+        .store
+        .backup_dir(namespace.clone(), snapshot.clone())
+        .with_context(|| prefix.to_string())?;
+
+    // Reader locks the snapshot
+    let reader = params
+        .source
+        .reader(namespace, snapshot)
+        .await
+        .with_context(|| prefix.to_string())?;
+
+    // Does not lock the manifest, but the reader already assures a locked snapshot
+    let source_manifest = match backup_dir.load_manifest() {
+        Ok((manifest, _raw_size)) => manifest,
+        Err(err) => {
+            // No manifest in snapshot or failed to read, warn and skip
+            log_sender
+                .log(
+                    Level::WARN,
+                    format!("{prefix}: Encountered errors: {err:#}"),
+                )
+                .await?;
+            log_sender
+                .log(Level::WARN, format!("{prefix}: Failed to load manifest!"))
+                .await?;
+            return Ok(stats);
+        }
+    };
+
+    if ignore_not_verified_or_encrypted(
+        &source_manifest,
+        snapshot,
+        params.verified_only,
+        params.encrypted_only,
+    ) {
+        return Ok(stats);
+    }
+
+    let mut encrypt_using_key = None;
+    if params.crypt_config.is_some() {
+        // Check if snapshot is fully encrypted or not encrypted at all:
+        // refuse progress otherwise to upload partially unencrypted contents or mix encryption key.
+        let files = source_manifest.files();
+        let all_unencrypted = files
+            .iter()
+            .all(|f| f.chunk_crypt_mode() == CryptMode::None);
+        let any_unencrypted = files
+            .iter()
+            .any(|f| f.chunk_crypt_mode() == CryptMode::None);
+
+        if all_unencrypted {
+            encrypt_using_key = params.crypt_config.clone();
+            log_sender
+                .log(
+                    Level::INFO,
+                    format!(
+                        "Encrypt source snapshot '{snapshot}' on the fly while pushing to remote"
+                    ),
+                )
+                .await?;
+        } else if any_unencrypted {
+            log_sender.log(
+                Level::WARN,
+                format!("Encountered partially encrypted snapshot '{snapshot}', refuse to re-encrypt and skip"),
+            ).await?;
+            return Ok(stats);
+        } else {
+            log_sender.log(
+                Level::INFO,
+                format!("Snapshot '{snapshot}' already encrypted with client key, not re-encrypting with configured active encryption key"),
+            ).await?;
+        }
+    }
+
+    // Writer instance locks the snapshot on the remote side
+    let backup_writer = BackupWriter::start(
+        &params.target.client,
+        BackupWriterOptions {
+            datastore: params.target.repo.store(),
+            ns: &target_ns,
+            backup: snapshot,
+            crypt_config: encrypt_using_key
+                .as_ref()
+                .map(|(_id, conf)| Arc::clone(conf)),
+            debug: false,
+            benchmark: false,
+            no_cache: false,
+        },
+    )
+    .await
+    .with_context(|| prefix.to_string())?;
+
+    // Use manifest of previous snapshots in group on target for chunk upload deduplication
+    let previous_manifest = if !fetch_previous_manifest {
+        None
+    } else {
+        let result = backup_writer
+            .download_previous_manifest(false)
+            .await
+            .context("failed to download")
+            .and_then(|manifest| {
+                check_previous_chunk_modes(
+                    &manifest,
+                    &source_manifest,
+                    encrypt_using_key.is_some(),
+                )?;
+                let fingerprint = manifest
+                    .fingerprint()
+                    .context("failed getting fingerprint")?;
+
+                let Some(manifest_key_fp) = fingerprint else {
+                    if encrypt_using_key.is_none() {
+                        return Ok(Arc::new(manifest));
+                    }
+                    bail!("previous snapshot not encrypted");
+                };
+
+                let signed_only = manifest
+                    .files()
+                    .iter()
+                    .all(|f| f.chunk_crypt_mode() == CryptMode::None);
+
+                let Some((_key_id, crypt_config)) = &encrypt_using_key else {
+                    if signed_only {
+                        return Ok(Arc::new(manifest));
+                    }
+
+                    // allow reuse for client side encrypted snapshots with matching key
+                    if let Some(source_key_fp) = source_manifest
+                        .fingerprint()
+                        .context("failed getting fingerprint on source")?
+                    {
+                        if manifest_key_fp == source_key_fp {
+                            return Ok(Arc::new(manifest));
+                        }
+                        bail!("previous snapshot encrypted using different key");
+                    };
+
+                    bail!("previous snapshot encrypted but no encryption key configured");
+                };
+
+                if *manifest_key_fp.bytes() == crypt_config.fingerprint() {
+                    if let Some(expected_signature) = &manifest.signature {
+                        let calculated_signature = manifest
+                            .signature(crypt_config)
+                            .context("signature calculation failed")?;
+                        if hex::encode(calculated_signature) == *expected_signature {
+                            return Ok(Arc::new(manifest));
+                        }
+                        bail!("signature mismatch with configured encryption key");
+                    }
+                    bail!("previous snapshots manifest not signed with configured encryption key");
+                }
+                bail!(
+                    "encryption key of previous snapshot does not match configured encryption key"
+                );
+            });
+
+        match result {
+            Ok(prev) => {
+                log_sender
+                    .log(
+                        Level::INFO,
+                        format!("{prefix}: Reusing previous manifest for deduplication"),
+                    )
+                    .await?;
+                Some(prev)
+            }
+            Err(err) => {
+                log_sender
+                    .log(
+                        Level::INFO,
+                        format!("{prefix}: Skip reuse of previous manifest - {err:#}"),
+                    )
+                    .await?;
+                None
+            }
+        }
+    };
+
+    // Dummy upload options: The actual compression already happened while
+    // the chunks were generated during creation of the backup snapshot,
+    // therefore pre-existing chunks (already compressed) can be pushed to
+    // the target.
+    //
+    // Further, these steps are skipped in the backup writer upload stream.
+    //
+    // Therefore, these values do not need to fit the values given in the manifest.
+    // The original manifest is uploaded in the end anyways.
+    //
+    // Compression is set to true so that the uploaded manifest will be compressed.
+    let upload_options = UploadOptions {
+        compress: true,
+        encrypt: encrypt_using_key.is_some(),
+        previous_manifest,
+        ..UploadOptions::default()
+    };
+
+    // Avoid double upload penalty by remembering already seen chunks
+    let known_chunks = Arc::new(Mutex::new(HashSet::with_capacity(64 * 1024)));
+    let mut target_manifest = BackupManifest::new(snapshot.clone());
+
+    for entry in source_manifest.files() {
+        let path = backup_dir.full_archive_path(&entry.filename);
+        if path.try_exists()? {
+            let archive_name = &entry.filename;
+            log_sender
+                .log(
+                    Level::INFO,
+                    format!("{prefix}: sync archive {archive_name}"),
+                )
+                .await?;
+            let archive_prefix = format!("{prefix}/{archive_name}");
+            let source_crypt_mode = entry.crypt_mode;
+            let target_crypt_mode = match encrypt_using_key.as_ref() {
+                Some(_) => CryptMode::Encrypt,
+                None => source_crypt_mode,
+            };
+
+            load_previous_snapshot_known_chunks(
+                &upload_options,
+                &backup_writer,
+                archive_name,
+                known_chunks.clone(),
+            )
+            .await;
+
+            match archive_name.archive_type() {
+                ArchiveType::Blob => {
+                    let backup_stats = if encrypt_using_key.is_some() {
+                        reencode_encrypted_and_upload_blob(
+                            path,
+                            archive_name,
+                            &backup_writer,
+                            &upload_options,
+                        )
+                        .await?
+                    } else {
+                        let file = std::fs::File::open(&path)?;
+                        backup_writer.upload_blob(file, archive_name).await?
+                    };
+                    target_manifest.add_file(
+                        archive_name,
+                        backup_stats.size,
+                        backup_stats.csum,
+                        target_crypt_mode,
+                    )?;
+                    log_sender
+                        .log(
+                            Level::INFO,
+                            format!(
+                                "{archive_prefix}: uploaded {} ({}/s)",
+                                HumanByte::from(backup_stats.size),
+                                HumanByte::new_binary(
+                                    backup_stats.size as f64 / backup_stats.duration.as_secs_f64()
+                                ),
+                            ),
+                        )
+                        .await
+                        .with_context(|| archive_prefix.clone())?;
+                    stats.add(SyncStats {
+                        chunk_count: backup_stats.chunk_count as usize,
+                        bytes: backup_stats.size as usize,
+                        elapsed: backup_stats.duration,
+                        removed: None,
+                    });
+                }
+                ArchiveType::DynamicIndex => {
+                    let index =
+                        DynamicIndexReader::open(&path).with_context(|| prefix.to_string())?;
+                    let chunk_reader = reader
+                        .chunk_reader(None, source_crypt_mode)
+                        .context("failed to get chunk reader")?;
+                    let upload_stats = push_index(
+                        archive_name,
+                        index,
+                        chunk_reader,
+                        &backup_writer,
+                        IndexType::Dynamic,
+                        known_chunks.clone(),
+                        encrypt_using_key
+                            .as_ref()
+                            .map(|(_id, conf)| Arc::clone(conf)),
+                    )
+                    .await
+                    .with_context(|| archive_prefix.clone())?;
+                    target_manifest
+                        .add_file(
+                            archive_name,
+                            upload_stats.size,
+                            upload_stats.csum,
+                            target_crypt_mode,
+                        )
+                        .with_context(|| archive_prefix.clone())?;
+                    log_sender
+                        .log(
+                            Level::INFO,
+                            format!(
+                                "{archive_prefix}: uploaded {} ({}/s)",
+                                HumanByte::from(upload_stats.size),
+                                HumanByte::new_binary(
+                                    upload_stats.size as f64 / upload_stats.duration.as_secs_f64()
+                                ),
+                            ),
+                        )
+                        .await?;
+                    stats.add(SyncStats {
+                        chunk_count: upload_stats.chunk_count as usize,
+                        bytes: upload_stats.size as usize,
+                        elapsed: upload_stats.duration,
+                        removed: None,
+                    });
+                }
+                ArchiveType::FixedIndex => {
+                    let index =
+                        FixedIndexReader::open(&path).with_context(|| prefix.to_string())?;
+                    let chunk_reader = reader
+                        .chunk_reader(None, source_crypt_mode)
+                        .context("failed to get chunk reader")
+                        .with_context(|| archive_prefix.clone())?;
+                    let size = index.index_bytes();
+                    let upload_stats = push_index(
+                        archive_name,
+                        index,
+                        chunk_reader,
+                        &backup_writer,
+                        IndexType::Fixed(Some(size)),
+                        known_chunks.clone(),
+                        encrypt_using_key
+                            .as_ref()
+                            .map(|(_id, conf)| Arc::clone(conf)),
+                    )
+                    .await
+                    .with_context(|| archive_prefix.clone())?;
+                    target_manifest
+                        .add_file(
+                            archive_name,
+                            upload_stats.size,
+                            upload_stats.csum,
+                            target_crypt_mode,
+                        )
+                        .with_context(|| archive_prefix.clone())?;
+                    log_sender
+                        .log(
+                            Level::INFO,
+                            format!(
+                                "{archive_prefix}: uploaded {} ({}/s)",
+                                HumanByte::from(upload_stats.size),
+                                HumanByte::new_binary(
+                                    upload_stats.size as f64 / upload_stats.duration.as_secs_f64()
+                                ),
+                            ),
+                        )
+                        .await?;
+                    stats.add(SyncStats {
+                        chunk_count: upload_stats.chunk_count as usize,
+                        bytes: upload_stats.size as usize,
+                        elapsed: upload_stats.duration,
+                        removed: None,
+                    });
+                }
+            }
+        } else {
+            bail!("{path:?} does not exist, aborting upload.");
+        }
+    }
+
+    // Fetch client log from source and push to target
+    // this has to be handled individually since the log is never part of the manifest
+    let client_log_name = &CLIENT_LOG_BLOB_NAME;
+    let client_log_path = backup_dir.full_archive_path(client_log_name);
+    if client_log_path.is_file() {
+        if encrypt_using_key.is_some() {
+            reencode_encrypted_and_upload_blob(
+                client_log_path,
+                client_log_name,
+                &backup_writer,
+                &upload_options,
+            )
+            .await
+            .with_context(|| prefix.to_string())?;
+        } else {
+            backup_writer
+                .upload_blob_from_file(&client_log_path, client_log_name, upload_options.clone())
+                .await
+                .with_context(|| prefix.to_string())?;
+        }
+    }
+
+    // Rewrite manifest for pushed snapshot, recreating manifest from source on target,
+    // needs to update all relevant info for new manifest.
+    target_manifest.unprotected = source_manifest.unprotected.clone();
+    if let Some((_id, crypt_config)) = &encrypt_using_key {
+        let sync_source_signature = source_manifest.signature(crypt_config)?;
+        target_manifest.set_sync_source_signature(&sync_source_signature)?;
+    } else {
+        target_manifest.signature = source_manifest.signature.clone();
+    };
+    // FIXME: replace me with to_data_blob once there is an upload_blob
+    let manifest_string =
+        target_manifest.to_string(encrypt_using_key.map(|(_, config)| config).as_deref())?;
+    let backup_stats = backup_writer
+        .upload_blob_from_data(
+            manifest_string.into_bytes(),
+            &MANIFEST_BLOB_NAME,
+            UploadOptions {
+                compress: true,
+                encrypt: false,
+                ..UploadOptions::default()
+            },
+        )
+        .await
+        .with_context(|| prefix.to_string())?;
+    backup_writer
+        .finish()
+        .await
+        .with_context(|| prefix.to_string())?;
+
+    stats.add(SyncStats {
+        chunk_count: backup_stats.chunk_count as usize,
+        bytes: backup_stats.size as usize,
+        elapsed: backup_stats.duration,
+        removed: None,
+    });
+
+    Ok(stats)
+}
+
+async fn reencode_encrypted_and_upload_blob<P: AsRef<Path>>(
+    path: P,
+    archive_name: &BackupArchiveName,
+    backup_writer: &BackupWriter,
+    upload_options: &UploadOptions,
+) -> Result<BackupStats, Error> {
+    let mut file = tokio::fs::File::open(&path).await?;
+    let data_blob = DataBlob::load_from_async_reader(&mut file).await?;
+    let raw_data = data_blob.decode(None, None)?;
+    backup_writer
+        .upload_blob_from_data(raw_data, archive_name, upload_options.clone())
+        .await
+}
+
+// Read fixed or dynamic index and push to target by uploading via the backup writer instance
+//
+// For fixed indexes, the size must be provided as given by the index reader.
+#[allow(clippy::too_many_arguments)]
+async fn push_index(
+    filename: &BackupArchiveName,
+    index: impl IndexFile + Send + 'static,
+    chunk_reader: Arc<dyn AsyncReadChunk>,
+    backup_writer: &BackupWriter,
+    index_type: IndexType,
+    known_chunks: Arc<Mutex<HashSet<[u8; 32]>>>,
+    crypt_config: Option<Arc<CryptConfig>>,
+) -> Result<BackupStats, Error> {
+    let (upload_channel_tx, upload_channel_rx) = mpsc::channel(20);
+
+    if let Some(crypt_config) = &crypt_config {
+        spawn_push_index_encrypted_worker(
+            index,
+            chunk_reader,
+            known_chunks,
+            Arc::clone(crypt_config),
+            upload_channel_tx,
+        )?;
+    } else {
+        spawn_push_index_worker(index, chunk_reader, known_chunks, upload_channel_tx)?;
+    }
+
+    let merged_chunk_info_stream = ReceiverStream::new(upload_channel_rx).map_err(Error::from);
+
+    let upload_options = UploadOptions {
+        compress: true,
+        encrypt: crypt_config.is_some(),
+        index_type,
+        ..UploadOptions::default()
+    };
+
+    let upload_stats = backup_writer
+        .upload_index_chunk_info(filename, merged_chunk_info_stream, upload_options)
+        .await?;
+
+    Ok(upload_stats)
+}
+
+fn spawn_push_index_worker(
+    index: impl IndexFile + Send + 'static,
+    chunk_reader: Arc<dyn AsyncReadChunk>,
+    known_chunks: Arc<Mutex<HashSet<[u8; 32]>>>,
+    upload_channel_tx: mpsc::Sender<Result<MergedChunkInfo, Error>>,
+) -> Result<(), Error> {
+    let mut chunk_infos =
+        stream::iter(0..index.index_count()).map(move |pos| index.chunk_info(pos).unwrap());
+
+    tokio::spawn(async move {
+        while let Some(chunk_info) = chunk_infos.next().await {
+            // Avoid reading known chunks, as they are not uploaded by the backup writer anyways
+            let needs_upload = {
+                // Need to limit the scope of the lock, otherwise the async block is not `Send`
+                let mut known_chunks = known_chunks.lock().unwrap();
+                // Check if present and insert, chunk will be read and uploaded below if not present
+                known_chunks.insert(chunk_info.digest)
+            };
+
+            let merged_chunk_info = if needs_upload {
+                chunk_reader
+                    .read_raw_chunk(&chunk_info.digest)
+                    .await
+                    .map(|chunk| {
+                        MergedChunkInfo::New(ChunkInfo {
+                            chunk,
+                            digest: chunk_info.digest,
+                            chunk_len: chunk_info.size(),
+                            offset: chunk_info.range.start,
+                        })
+                    })
+            } else {
+                Ok(MergedChunkInfo::Known(vec![(
+                    // Pass size instead of offset, will be replaced with offset by the backup
+                    // writer
+                    chunk_info.size(),
+                    chunk_info.digest,
+                )]))
+            };
+            let _ = upload_channel_tx.send(merged_chunk_info).await;
+        }
+    });
+
+    Ok(())
+}
+
+fn spawn_push_index_encrypted_worker(
+    index: impl IndexFile + Send + 'static,
+    chunk_reader: Arc<dyn AsyncReadChunk>,
+    known_chunks: Arc<Mutex<HashSet<[u8; 32]>>>,
+    crypt_config: Arc<CryptConfig>,
+    upload_channel_tx: mpsc::Sender<Result<MergedChunkInfo, Error>>,
+) -> Result<(), Error> {
+    let mut chunk_infos =
+        stream::iter(0..index.index_count()).map(move |pos| index.chunk_info(pos).unwrap());
+
+    tokio::spawn(async move {
+        let mut encrypted_mapping = HashMap::new();
+        while let Some(chunk_info) = chunk_infos.next().await {
+            // in re-encrypting mode, we need to read and encrypt each chunk once to know
+            // whether we need to upload it
+            let merged_chunk_info =
+                if let Some(encrypted_digest) = encrypted_mapping.get(&chunk_info.digest) {
+                    Ok(MergedChunkInfo::Known(vec![(
+                        // Pass size instead of offset, will be replaced with offset by the backup
+                        // writer
+                        chunk_info.size(),
+                        *encrypted_digest,
+                    )]))
+                } else {
+                    chunk_reader
+                        .read_raw_chunk(&chunk_info.digest)
+                        .await
+                        .and_then(|chunk| {
+                            let data = chunk.decode(None, Some(&chunk_info.digest))?;
+                            let (encrypted_chunk, encrypted_digest) = DataChunkBuilder::new(&data)
+                                .compress(true)
+                                .crypt_config(&crypt_config)
+                                .build()?;
+                            encrypted_mapping.insert(chunk_info.digest, encrypted_digest);
+                            // if this encrypted chunk is already referenced by the previous
+                            // snapshot, the upload can be skipped
+                            if known_chunks.lock().unwrap().contains(&encrypted_digest) {
+                                Ok(MergedChunkInfo::Known(vec![(
+                                    // Pass size instead of offset, will be replaced with offset by the backup
+                                    // writer
+                                    chunk_info.size(),
+                                    encrypted_digest,
+                                )]))
+                            } else {
+                                Ok(MergedChunkInfo::New(ChunkInfo {
+                                    chunk: encrypted_chunk,
+                                    digest: encrypted_digest,
+                                    chunk_len: data.len() as u64,
+                                    offset: chunk_info.range.start,
+                                }))
+                            }
+                        })
+                };
+            let _ = upload_channel_tx.send(merged_chunk_info).await;
+        }
+    });
+
+    Ok(())
+}

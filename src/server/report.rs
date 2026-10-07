@@ -1,0 +1,256 @@
+use std::fmt::Write;
+use std::path::Path;
+use std::process::Command;
+
+use proxmox_network_api::NetworkInterfaceType;
+
+fn get_top_processes() -> String {
+    let (exe, args) = ("top", vec!["-b", "-c", "-w512", "-n", "1", "-o", "TIME"]);
+    let output = Command::new(exe).args(&args).output();
+    let output = match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(err) => err.to_string(),
+    };
+    let output = output.lines().take(30).collect::<Vec<&str>>().join("\n");
+    format!("$ `{exe} {}`\n```\n{output}\n```", args.join(" "))
+}
+
+fn files() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "General System Info",
+            vec![
+                "/etc/hostname",
+                "/etc/hosts",
+                "/etc/network/interfaces",
+                "/etc/apt/sources.list",
+                "/etc/apt/sources.list.d/",
+                "/proc/pressure/",
+            ],
+        ),
+        (
+            "Datastores & Remotes",
+            vec!["/etc/proxmox-backup/datastore.cfg"],
+        ),
+        (
+            "User & Access",
+            vec![
+                "/etc/proxmox-backup/user.cfg",
+                "/etc/proxmox-backup/acl.cfg",
+            ],
+        ),
+        ("Remotes", vec!["/etc/proxmox-backup/remote.cfg"]),
+        (
+            "Jobs",
+            vec![
+                "/etc/proxmox-backup/sync.cfg",
+                "/etc/proxmox-backup/prune.cfg",
+                "/etc/proxmox-backup/verification.cfg",
+            ],
+        ),
+        (
+            "Tape",
+            vec![
+                "/etc/proxmox-backup/tape.cfg",
+                "/etc/proxmox-backup/media-pool.cfg",
+            ],
+        ),
+        (
+            "Others",
+            vec![
+                "/etc/proxmox-backup/node.cfg",
+                "/etc/proxmox-backup/traffic-control.cfg",
+            ],
+        ),
+    ]
+}
+
+fn commands() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        //  ("<command>", vec![<arg [, arg]>])
+        ("date", vec!["-R"]),
+        ("proxmox-backup-manager", vec!["versions", "--verbose"]),
+        ("proxmox-backup-manager", vec!["subscription", "get"]),
+        ("proxmox-backup-manager", vec!["ldap", "list"]),
+        ("proxmox-backup-manager", vec!["openid", "list"]),
+        ("proxmox-boot-tool", vec!["status"]),
+        ("df", vec!["-h"]),
+        (
+            "lsblk",
+            vec![
+                "--ascii",
+                "-M",
+                "-o",
+                "+HOTPLUG,ROTA,PHY-SEC,FSTYPE,MODEL,TRAN",
+            ],
+        ),
+        ("bash", vec!["-c", "ls -l /dev/disk/by-*/"]),
+        ("zpool", vec!["status"]),
+        ("zfs", vec!["list"]),
+        ("zarcstat", vec![]),
+        ("dmidecode", vec!["-t", "bios"]),
+        ("lscpu", vec![]),
+        ("lspci", vec!["-nnk"]),
+        ("ip", vec!["-details", "-statistics", "a"]),
+    ]
+}
+
+fn dynamic_commands() -> Vec<(&'static str, Vec<String>)> {
+    let mut commands = Vec::new();
+
+    match proxmox_network_api::config() {
+        Ok((config, _)) => {
+            for (name, iface) in config.interfaces {
+                if iface.interface_type == NetworkInterfaceType::Eth {
+                    commands.push(("ethtool", vec![name]));
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("failed to query network interfaces: {err}");
+        }
+    }
+
+    commands
+}
+
+// (description, function())
+type FunctionMapping = (&'static str, fn() -> String);
+
+fn function_calls() -> Vec<FunctionMapping> {
+    vec![
+        ("Datastores", || {
+            let config = match pbs_config::datastore::config() {
+                Ok((config, _digest)) => config,
+                _ => return String::from("could not read datastore config"),
+            };
+
+            let mut list = Vec::new();
+            for store in config.sections.keys() {
+                list.push(store.as_str());
+            }
+            format!("```\n{}\n```", list.join(", "))
+        }),
+        ("System Load & Uptime", get_top_processes),
+    ]
+}
+
+fn get_file_content(file: impl AsRef<Path>) -> String {
+    use proxmox_sys::fs::file_read_optional_string;
+    let content = match file_read_optional_string(&file) {
+        Ok(Some(content)) => content,
+        Ok(None) => String::from("# file does not exist"),
+        Err(err) => err.to_string(),
+    };
+    let file_name = file.as_ref().display();
+    format!("`$ cat '{file_name}'`\n```\n{}\n```", content.trim_end())
+}
+
+fn get_directory_content(path: impl AsRef<Path>) -> String {
+    let read_dir_iter = match std::fs::read_dir(&path) {
+        Ok(iter) => iter,
+        Err(err) => {
+            return format!(
+                "`$ cat '{}*'`\n```\n# read dir failed - {err}\n```",
+                path.as_ref().display(),
+            );
+        }
+    };
+    let mut out = String::new();
+    let mut first = true;
+    for entry in read_dir_iter {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                let _ = writeln!(out, "error during read-dir - {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_file() {
+            if first {
+                let _ = writeln!(out, "{}", get_file_content(path));
+                first = false;
+            } else {
+                let _ = writeln!(out, "\n{}", get_file_content(path));
+            }
+        } else {
+            let _ = writeln!(out, "skipping sub-directory `{}`", path.display());
+        }
+    }
+    out
+}
+
+fn get_command_output(exe: &str, args: &Vec<&str>) -> String {
+    let output = Command::new(exe)
+        .env("PROXMOX_OUTPUT_NO_BORDER", "1")
+        .args(args)
+        .output();
+    let output = match output {
+        Ok(output) => {
+            let mut out = String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .trim_end()
+                .to_string();
+            if !stderr.is_empty() {
+                let _ = writeln!(out, "\n```\nSTDERR:\n```\n{stderr}");
+            }
+            out
+        }
+        Err(err) => err.to_string(),
+    };
+    format!("$ `{exe} {}`\n```\n{output}\n```", args.join(" "))
+}
+
+pub fn generate_report() -> String {
+    let file_contents = files()
+        .iter()
+        .map(|group| {
+            let (group, files) = group;
+            let group_content = files
+                .iter()
+                .map(|file_name| {
+                    let path = Path::new(file_name);
+                    if path.is_dir() {
+                        get_directory_content(path)
+                    } else {
+                        get_file_content(file_name)
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join("\n\n");
+
+            format!("### {group}\n\n{group_content}")
+        })
+        .collect::<Vec<String>>()
+        .join("\n\n");
+
+    let static_command_outputs = commands()
+        .into_iter()
+        .map(|(command, args)| get_command_output(command, &args));
+
+    let dynamic_command_outputs = dynamic_commands().into_iter().map(|(command, args)| {
+        let args = args.iter().map(String::as_str).collect();
+        get_command_output(command, &args)
+    });
+
+    let command_outputs = static_command_outputs
+        .chain(dynamic_command_outputs)
+        .collect::<Vec<String>>()
+        .join("\n\n");
+
+    let function_outputs = function_calls()
+        .iter()
+        .map(|(desc, function)| {
+            let output = function();
+            format!("#### {desc}\n{}\n", output.trim_end())
+        })
+        .collect::<Vec<String>>()
+        .join("\n\n");
+
+    format!(
+        "## FILES\n\n{file_contents}\n## COMMANDS\n\n{command_outputs}\n## FUNCTIONS\n\n{function_outputs}\n"
+    )
+}

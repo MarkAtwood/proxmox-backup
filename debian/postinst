@@ -1,0 +1,66 @@
+#!/bin/sh
+
+set -e
+
+#DEBHELPER#
+
+case "$1" in
+    configure)
+	# need to have user backup in the tape group
+	usermod -a -G tape backup
+
+	# FIXME: remove after beta is over and add hunk to actively remove the repo
+	BETA_SOURCES="/etc/apt/sources.list.d/pbs-test-for-beta.sources"
+    if test -f "$BETA_SOURCES" && dpkg --compare-versions "$2" 'lt' '4.0.11-1' && dpkg --compare-versions "$2" 'gt' '4.0~~'; then
+        printf "\nNOTE: Remove the pbs-test repository, which was added during the beta phase.\nYou can (re-)add repositories on the web UI (Administration -> Repositories)\n\n"
+        rm -v "$BETA_SOURCES" || true
+    fi
+
+	# modeled after dh_systemd_start output
+	systemctl --system daemon-reload >/dev/null || true
+	if [ -n "$2" ]; then
+		_dh_action=try-reload-or-restart
+	else
+		_dh_action=start
+	fi
+	deb-systemd-invoke $_dh_action proxmox-backup.service proxmox-backup-proxy.service >/dev/null || true
+
+	if test -n "$2"; then
+		# FIXME: Remove in future version once we're sure no broken entries remain in anyone's files
+		if grep -q -e ':termproxy::[^@]\+: ' /var/log/proxmox-backup/tasks/active; then
+			echo "Fixing up termproxy user id in task log..."
+			flock -w 30 /var/log/proxmox-backup/tasks/active.lock sed -i 's/:termproxy::\([^@]\+\): /:termproxy::\1@pam: /' /var/log/proxmox-backup/tasks/active || true
+		fi
+
+		# TODO: remove with 4.1+, this was just exposed on internal testing.
+		if dpkg --compare-versions "$2" 'lt' '4.0.5~'; then
+			if [ -e /etc/proxmox-backup/s3.cfg ]; then
+				sed -i 's/^s3client:/s3-endpoint:/' /etc/proxmox-backup/s3.cfg \
+				 || echo "Failed to rename 's3client' config section-type to 's3-endpoint' in /etc/proxmox-backup/s3.cfg."
+			fi
+		fi
+
+		# TODO: remove with PBS 5+
+		if dpkg --compare-versions "$2" 'lt' '4.0.2~'; then
+			proxmox-backup-manager migrate-config default-notification-mode \
+			    || echo "Failed migrate tape-job/datastore notification mode, please check manually"
+		fi
+
+		if dpkg --compare-versions "$2" 'lt' '3.3.5~'; then
+			# ensure old locking is used by the daemon until a reboot happened
+			touch "/run/proxmox-backup/old-locking"
+		fi
+
+	fi
+    ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+exit 0

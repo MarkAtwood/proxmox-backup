@@ -1,0 +1,394 @@
+.. _tech_design_overview:
+
+Technical Overview
+==================
+
+Datastores
+----------
+
+A Datastore is the logical place where :ref:`Backup Snapshots
+<term_backup_snapshot>` and their chunks are stored. Snapshots consist of a
+manifest, blobs, and dynamic- and fixed-indexes (see :ref:`terms`), and are
+stored in the following directory structure:
+
+ <datastore-root>/<type>/<id>/<time>/
+
+The deduplication of datastores is based on reusing chunks, which are
+referenced by the indexes in a backup snapshot. This means that multiple
+indexes can reference the same chunks, reducing the amount of space needed to
+contain the data (even across backup snapshots).
+
+Snapshots
+---------
+
+A Snapshot is the collection of manifest, blobs and indexes that represent
+a backup. When a client creates a snapshot, it can upload blobs (single files
+which are not chunked, e.g. the client log), or one or more indexes
+(fixed or dynamic).
+
+When uploading an index, the client first has to read the source data, chunk it
+and send the data as chunks with their identifying checksum to the server.
+When using the :ref:`change detection mode <change_detection_mode>` payload
+chunks for unchanged files are reused from the previous snapshot, thereby not
+reading the source data again.
+
+If there is a previous Snapshot in the backup group, the client can first
+download the chunk list of the previous Snapshot. If it detects a chunk that
+already exists on the server, it can send only the checksum instead of data
+and checksum. This way the actual upload of Snapshots is incremental while
+each Snapshot references all chunks and is thus a full backup.
+
+After uploading all data, the client has to signal to the server that the
+backup is finished. If that is not done before the connection closes, the
+server will remove the unfinished snapshot.
+
+Chunks
+------
+
+A chunk is some (possibly encrypted) data with a CRC-32 checksum at the end and
+a type marker at the beginning. It is identified by the SHA-256 checksum of its
+content.
+
+To generate such chunks, backup data is split either into fixed-size or
+dynamically sized chunks. The same content will be hashed to the same checksum.
+
+The chunks of a datastore are found in
+
+ <datastore-root>/.chunks/
+
+This chunk directory is further subdivided into directories grouping chunks by
+their checksums 2 byte prefix (given as 4 hexadecimal digits), so a chunk with
+the checksum
+
+ a342e8151cbf439ce65f3df696b54c67a114982cc0aa751f2852c2f7acc19a8b
+
+lives in
+
+ <datastore-root>/.chunks/a342/
+
+This is done to reduce the number of files per directory, as having many files
+per directory can be bad for file system performance.
+
+These chunk directories ('0000'-'ffff') will be preallocated when a datastore
+is created.
+
+Fixed-Sized Chunks
+^^^^^^^^^^^^^^^^^^
+
+For block based backups (like VMs), fixed-sized chunks are used. The content
+(disk image), is split into chunks of the same length (typically 4 MiB).
+
+This works very well for VM images, since the file system on the guest most
+often tries to allocate files in contiguous pieces, so new files get new
+blocks, and changing existing files changes only their own blocks.
+
+As an optimization, VMs in `Proxmox VE`_ can make use of 'dirty bitmaps', which
+can track the changed blocks of an image. Since these bitmaps are also a
+representation of the image split into chunks, there is a direct relation
+between the dirty blocks of the image and chunks which need to be uploaded.
+Thus, only modified chunks of the disk need to be uploaded to a backup.
+
+Since the image is always split into chunks of the same size, unchanged blocks
+will result in identical checksums for those chunks, so such chunks do not need
+to be backed up again. This way storage snapshots are not needed to find the
+changed blocks.
+
+For consistency, `Proxmox VE`_ uses a QEMU internal snapshot mechanism, that
+does not rely on storage snapshots either.
+
+Dynamically Sized Chunks
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+When working with file-based systems rather than block-based systems,
+using fixed-sized chunks is not a good idea, since every time a file
+would change in size, the remaining data would be shifted around,
+resulting in many chunks changing and the amount of deduplication being reduced.
+
+To improve this, `Proxmox Backup`_ Server uses dynamically sized chunks
+instead. Instead of splitting an image into fixed sizes, it first generates a
+consistent file archive (:ref:`pxar <pxar-format>`) and uses a rolling hash
+over this on-the-fly generated archive to calculate chunk boundaries.
+
+We use a variant of Buzhash which is a cyclic polynomial algorithm. It works
+by continuously calculating a checksum while iterating over the data, and on
+certain conditions, it triggers a hash boundary.
+
+Assuming that most files on the system that is to be backed up have not
+changed, eventually the algorithm triggers the boundary on the same data as a
+previous backup, resulting in chunks that can be reused.
+
+Encrypted Chunks
+^^^^^^^^^^^^^^^^
+
+Encrypted chunks are a special case. Both fixed- and dynamically sized chunks
+can be encrypted, and they are handled in a slightly different manner than
+normal chunks.
+
+The hashes of encrypted chunks are calculated not with the actual (encrypted)
+chunk content, but with the plain-text content, concatenated with the encryption
+key. This way, two chunks with the same data but encrypted with different keys
+generate two different checksums and no collisions occur for multiple
+encryption keys.
+
+This is done to speed up the client part of the backup, since it only needs to
+encrypt chunks that are actually getting uploaded. Chunks that exist already in
+the previous backup, do not need to be encrypted and uploaded.
+
+Change Detection Mode for File-Based Backups
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The change detection mode controls how to detect and act for files which did not
+change in-between subsequent backup runs as well as the archive file format used
+to encode the directory entries.
+
+There are 3 modes available, the current default ``legacy`` mode, as well as the
+``data`` and ``metadata`` mode. While the ``legacy`` mode encodes all contents
+in a single ``pxar`` archive, the latter two modes split data and metadata into
+``ppxar`` and ``mpxar`` archives. This is done to allow for fast comparison of
+metadata with the previous snapshot, used by the ``metadata`` mode to detect
+reusable files. The ``data`` mode refrains from reusing unchanged files by
+rechunking the file unconditionally. This mode therefore assures that no file
+changes are missed even if the metadata are unchanged.
+
+.. NOTE:: ``pxar`` and ``mpxar``/``ppxar`` file formats are different and cannot
+    be deduplicated as efficiently if a datastore stores archive snapshots of
+    both types.
+
+As the change detection modes are client side changes, they are backwards
+compatible with older versions of Proxmox Backup Server. Exploring the backup
+contents for the new archive format via the web interface requires however a
+Proxmox Backup Server with version 3.2.5 or higher. Upgrading to the latest
+version is recommended for full feature compatibility.
+
+.. _change-detection-mode-legacy:
+
+Legacy Mode
++++++++++++
+
+Backup snapshots of filesystems are created by recursively scanning the
+directory entries. All entries to be included in the snapshot are read and
+serialized by encoding them using the ``pxar``
+:ref:`archive format <pxar-format>`. The resulting stream is chunked into
+:ref:`dynamically sized chunks <dynamically-sized-chunks>` and uploaded to the
+Proxmox Backup Server, deduplicating chunks based on their content digest for
+space efficient storage.
+File contents are read and chunked unconditionally, no check is performed to
+detect unchanged files.
+
+.. _change-detection-mode-data:
+
+Data Mode
++++++++++
+
+Like for ``legacy`` mode file contents are read and chunked unconditionally, no
+check is performed to detect unchanged files.
+
+However, in contrast to ``legacy`` mode, which stores entries metadata and data
+in a single self-contained ``pxar`` archive, the ``data`` mode encodes metadata
+and file contents into two separate streams. The resulting backup snapshots
+therefore contain split archives, an archive in ``mpxar``
+:ref:`format <pxar-meta-format>` containing the entries metadata and an archive
+with ``ppxar`` :ref:`format <ppxar-format>` , containing the actual file
+contents, separated by payload headers for consistency checks. The metadata
+archive stores a reference offset to the corresponding payload archive entry so
+the file contents can be accessed. Both of these archives are chunked and
+uploaded by the Proxmox backup client, resulting in separated indices and
+independent chunks.
+
+The ``mpxar`` archive can be used to efficiently fetch the associated metadata
+for archive entries without the overhead of payload data stored within the same
+chunks. This is used for example for entry lookups to list the archive contents
+or to navigate the mounted filesystem via the FUSE implementation. No dedicated
+catalog is therefore created for archives encoded using this mode.
+
+By not comparing metadata to the previous backup snapshot, no files will be
+considered reusable by this mode, in contrast to the ``metadata`` mode.
+Latter can reuse files which have changed, but file size and mtime did not
+change because restored after changing the files contents.
+
+.. _change-detection-mode-metadata:
+
+Metadata Mode
++++++++++++++
+
+The ``metadata`` mode detects files whose file metadata did not change
+in-between subsequent backup runs. The metadata comparison includes file size,
+file type, ownership and permission information, as well as acls and attributes
+and most importantly the file's mtime, for details see the
+:ref:`pxar metadata archive format <pxar-meta-format>`. Files ctime and inode
+number are not stored and used for comparison, since some tools (e.g.
+``vzdump``) might sync the contents of the filesystem to a temporary location
+before actually performing the backup via the Proxmox backup client. For these
+cases, ctime and inode number will always change.
+
+This mode will avoid reading and rechunking the file contents whenever possible
+by reusing the file content chunks of unchanged files from the previous backup
+snapshot.
+
+To compare the metadata, the previous snapshots ``mpxar`` metadata archive is
+downloaded at the start of the backup run and used as a reference. Further, the
+index of the payload archive ``ppxar`` is fetched and used to lookup the file
+content chunk's digests, which will be used to reindex pre-existing chunks
+without the need to reread and rechunk the file contents.
+
+During backup, the metadata and payload archives are encoded in the same manner
+as for the ``data`` mode, but for the ``metadata`` mode each entry is
+additionally looked up in the metadata reference archive for comparison first.
+If the file did not change as compared to the reference, the file is considered
+as unchanged and the Proxmox backup client enters a look-ahead caching mode. In
+this mode, the client will keep reading and comparing then following entries in
+the filesystem as long as they are reusable. Further, it keeps track of the
+payload archive offset range these file contents are stored in. The additional
+look-ahead caching is needed, as file boundaries are not required to be aligned
+with chunk boundaries, therefore reused chunks can contain possibly wasted chunk
+content (also called padding) if reused unconditionally.
+
+The look-ahead cache will greedily cache all unchanged entries up to the point
+where either the cache size limit is reached, a file entry with changed
+metadata is encountered, or the range of payload chunks considered for reuse is
+not continuous. An example for the latter is a file which disappeared in-between
+subsequent backup runs, leaving a hole in the range. At this point, the caching
+mode is disabled and the client calculates the wasted padding size which would
+be introduced by reusing the payload chunks for all the unchanged files cached
+up to this point. If the padding is acceptable (below a preset limit of 10% of
+the actually reused chunk content), the files are reused by encoding them in the
+metadata archive using updated offset references to the contents and reindexing
+the pre-existing chunks in the new ``ppxar`` archive. If however the padding is
+not acceptable, exceeding the limit, all cached entries are reencoded, not
+reusing any of the pre-existing data. The metadata as cached will be encoded in
+the metadata archive, no matter if cached file contents are to be reused or
+reencoded.
+
+This combination of look-ahead caching and reuse of pre-existing payload archive
+chunks for files with unchanged contents therefore speeds up the backup
+process by avoiding rereading and rechunking file contents whenever possible.
+
+To reduce paddings and increase chunk reusability, during creation of the
+archives in ``data`` mode and ``metadata`` mode the pxar encoder signals
+encountered file boundaries as suggested chunk boundaries to the sliding window
+chunker. The chunker then decides based on the internal state if the suggested
+boundary is accepted or disregarded.
+
+Caveats and Limitations
+-----------------------
+
+Notes on Hash Collisions
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Every hashing algorithm has a chance to produce collisions, meaning two (or
+more) inputs generate the same checksum. For SHA-256, this chance is
+negligible. To calculate the chances of such a collision, one can use the ideas
+of the 'birthday problem' from probability theory. For big numbers, this is
+actually unfeasible to calculate with regular computers, but there is a good
+approximation:
+
+.. math::
+
+ p(n, d) = 1 - e^{-n^2/(2d)}
+
+Where `n` is the number of tries, and `d` is the number of possibilities.
+For a concrete example, lets assume a large datastore of 1 PiB and an average
+chunk size of 4 MiB. That means :math:`n = 268435456` tries, and :math:`d =
+2^{256}` possibilities. Inserting those values in the formula from earlier you
+will see that the probability of a collision in that scenario is:
+
+.. math::
+
+ 3.1115 * 10^{-61}
+
+For context, in a lottery game of guessing 6 numbers out of 45, the chance to
+correctly guess all 6 numbers is only :math:`1.2277 * 10^{-7}`. This means the
+chance of a collision is lower than winning 8 such lottery games *in a row*:
+:math:`(1.2277 * 10^{-7})^{8} = 5.1623 * 10^{-56}`.
+
+In conclusion, it is extremely unlikely that such a collision would occur by
+accident in a normal datastore.
+
+Additionally, SHA-256 is prone to length extension attacks, but since there is
+an upper limit for how big the chunks are, this is not a problem, because a
+potential attacker cannot arbitrarily add content to the data beyond that
+limit.
+
+File-Based Backup
+^^^^^^^^^^^^^^^^^
+
+Since dynamically sized chunks (for file-based backups) are created on a custom
+archive format (pxar) and not over the files directly, there is no relation
+between the files and chunks. This means that the Proxmox Backup Client has to
+read all files again for every backup, otherwise it would not be possible to
+generate a consistent, independent pxar archive where the original chunks can be
+reused. Note that in spite of this, only new or changed chunks will be uploaded.
+
+In order to avoid these limitations, the Change Detection Mode ``metadata`` was
+introduced.
+
+Verification of Encrypted Chunks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For encrypted chunks, only the checksum of the original (plaintext) data is
+available, making it impossible for the server (without the encryption key) to
+verify its content against it. Instead only the CRC-32 checksum gets checked.
+
+Troubleshooting
+---------------
+
+Index files(*.fidx*, *.didx*) contain information about how to rebuild a file.
+More precisely, they contain an ordered list of references to the chunks that
+the original file was split into. If there is something wrong with a snapshot,
+it might be useful to find out which chunks are referenced in it, and check
+whether they are present and intact. The ``proxmox-backup-debug`` command-line
+tool can be used to inspect such files and recover their contents. For example,
+to get a list of the referenced chunks of a *.fidx* index:
+
+.. code-block:: console
+
+    # proxmox-backup-debug inspect file drive-scsi0.img.fidx
+
+The same command can be used to inspect *.blob* files. Without the ``--decode``
+parameter, just the size and the encryption type, if any, are printed. If
+``--decode`` is set, the blob file is decoded into the specified file ('-' will
+decode it directly to stdout).
+
+The following example would print the decoded contents of
+`qemu-server.conf.blob`. If the file you're trying to inspect is encrypted, a
+path to the key file must be provided using ``--keyfile``.
+
+.. code-block:: console
+
+    # proxmox-backup-debug inspect file qemu-server.conf.blob --decode -
+
+You can also check in which index files a specific chunk file is referenced
+with:
+
+.. code-block:: console
+
+    # proxmox-backup-debug inspect chunk b531d3ffc9bd7c65748a61198c060678326a431db7eded874c327b7986e595e0 --reference-filter /path/in/a/datastore/directory
+
+Here ``--reference-filter`` specifies where index files should be searched. This
+can be an arbitrary path. If, for some reason, the filename of the chunk was
+changed, you can explicitly specify the digest using ``--digest``. By default, the
+chunk filename is used as the digest to look for. If no ``--reference-filter``
+is specified, it will only print the CRC and encryption status of the chunk. You
+can also decode chunks, by setting the ``--decode`` flag. If the chunk is
+encrypted, a ``--keyfile`` must be provided, in order to decode it.
+
+Restore without a Running Proxmox Backup Server
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+It's possible to restore specific files from a snapshot, without a running
+`Proxmox Backup`_ Server instance, using the ``recover`` subcommand, provided
+you have access to the intact index and chunk files. Note that you also need the
+corresponding key file if the backup was encrypted.
+
+.. code-block:: console
+
+    # proxmox-backup-debug recover index drive-scsi0.img.fidx /path/to/.chunks
+
+In the above example, the `/path/to/.chunks` argument is the path to the
+directory that contains the chunks, and `drive-scsi0.img.fidx` is the index file
+of the file you'd like to restore. Both paths can be absolute or relative. With
+``--skip-crc``, it's possible to disable the CRC checks of the chunks. This
+will speed up the process slightly and allow for trying to restore (partially)
+corrupt chunks. It's recommended to always try without the skip-CRC option
+first.
+

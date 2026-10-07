@@ -1,0 +1,383 @@
+use pbs_api_types::{APTUpdateInfo, GarbageCollectionStatus};
+use serde::Serialize;
+
+// NOTE: For some of these types, the `XyzOkTemplateData` and `XyzErrTemplateData`
+// types are almost identical except for the `error` member.
+// While at first glance I might make sense
+// to consolidate the two and make `error` an `Option`, I would argue
+// that it is actually quite nice to have a single, distinct type for
+// each template. This makes it 100% clear which params are accessible
+// for every single template, at the cost of some boilerplate code.
+
+/// Template data which should be available in *all* notifications.
+/// The fields of this struct will be flattened into the individual
+/// *TemplateData structs.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommonData {
+    /// The hostname of the PBS host.
+    pub hostname: String,
+    /// The FQDN of the PBS host.
+    pub fqdn: String,
+    /// The base URL for building links to the web interface.
+    pub base_url: String,
+}
+
+impl CommonData {
+    pub fn new() -> CommonData {
+        let nodename = proxmox_sys::nodename();
+        let mut fqdn = nodename.to_owned();
+
+        if let Ok(resolv_conf) = crate::api2::node::dns::read_etc_resolv_conf() {
+            if let Some(search) = resolv_conf["search"].as_str() {
+                fqdn.push('.');
+                fqdn.push_str(search);
+            }
+        }
+
+        // TODO: Some users might want to be able to override this.
+        let base_url = format!("https://{fqdn}:8007");
+
+        CommonData {
+            hostname: nodename.into(),
+            fqdn,
+            base_url,
+        }
+    }
+}
+
+/// Template data for the gc-ok template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GcOkTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The task's UPID.
+    pub upid: Option<String>,
+    /// Number of processed index files.
+    pub index_file_count: usize,
+    /// Sum of bytes referred by index files.
+    pub index_data_bytes: u64,
+    /// Bytes used on disk.
+    pub disk_bytes: u64,
+    /// Chunks used on disk.
+    pub disk_chunks: usize,
+    /// Sum of removed bytes.
+    pub removed_bytes: u64,
+    /// Number of removed chunks.
+    pub removed_chunks: usize,
+    /// Sum of pending bytes (pending removal - kept for safety).
+    pub pending_bytes: u64,
+    /// Number of pending chunks (pending removal - kept for safety).
+    pub pending_chunks: usize,
+    /// Number of chunks marked as .bad by verify that have been removed by GC.
+    pub removed_bad: usize,
+    /// Number of chunks still marked as .bad after garbage collection.
+    pub still_bad: usize,
+    /// Factor of deduplication.
+    pub deduplication_factor: String,
+}
+
+impl GcOkTemplateData {
+    /// Create new a new instance.
+    pub fn new(datastore: String, status: &GarbageCollectionStatus) -> Self {
+        let deduplication_factor = if status.disk_bytes > 0 {
+            (status.index_data_bytes as f64) / (status.disk_bytes as f64)
+        } else {
+            1.0
+        };
+        let deduplication_factor = format!("{deduplication_factor:.2}");
+
+        Self {
+            common: CommonData::new(),
+            datastore,
+            upid: status.upid.clone(),
+            index_file_count: status.index_file_count,
+            index_data_bytes: status.index_data_bytes,
+            disk_bytes: status.disk_bytes,
+            disk_chunks: status.disk_chunks,
+            removed_bytes: status.removed_bytes,
+            removed_chunks: status.removed_chunks,
+            pending_bytes: status.pending_bytes,
+            pending_chunks: status.pending_chunks,
+            removed_bad: status.removed_bad,
+            still_bad: status.still_bad,
+            deduplication_factor,
+        }
+    }
+}
+
+/// Template data for the gc-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GcErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The error that occurred during the GC job.
+    pub error: String,
+}
+
+impl GcErrTemplateData {
+    /// Create new a new instance.
+    pub fn new(datastore: String, error: String) -> Self {
+        Self {
+            common: CommonData::new(),
+            datastore,
+            error,
+        }
+    }
+}
+
+/// Template data for the acme-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AcmeErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The error that occurred when trying to request the certificate.
+    pub error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+/// A single package which can be upgraded.
+pub struct UpgradablePackage {
+    /// The name of the package.
+    package_name: String,
+    /// The new version which can be installed.
+    available_version: String,
+    /// The currently installed version.
+    installed_version: Option<String>,
+}
+
+/// Template data for the package-updates template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PackageUpdatesTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    pub available_updates: Vec<UpgradablePackage>,
+}
+
+impl PackageUpdatesTemplateData {
+    /// Create new a new instance.
+    pub fn new(updates: &[&APTUpdateInfo]) -> Self {
+        Self {
+            common: CommonData::new(),
+            available_updates: updates
+                .iter()
+                .map(|info| UpgradablePackage {
+                    package_name: info.package.clone(),
+                    available_version: info.version.clone(),
+                    installed_version: info.old_version.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Template data for the prune-ok template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PruneOkTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+}
+
+/// Template data for the prune-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PruneErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+    /// The error that occurred during the prune job.
+    pub error: String,
+}
+
+/// Template data for the sync-ok template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyncOkTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+    /// The remote.
+    pub remote: Option<String>,
+    /// The remote datastore we synced to/from.
+    pub remote_datastore: String,
+}
+
+/// Template data for the sync-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyncErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+    /// The remote.
+    pub remote: Option<String>,
+    /// The remote datastore we synced to/from.
+    pub remote_datastore: String,
+    /// The error that occurred during the sync job.
+    pub error: String,
+}
+
+/// Template data for the tape-backup-ok template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TapeBackupOkTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore that was backed up.
+    pub datastore: String,
+    /// The optional job id for this tape backup job.
+    pub job_id: Option<String>,
+    /// The total duration of the backup job in seconds.
+    pub job_duration: u64,
+    /// The tape pool.
+    pub tape_pool: String,
+    /// The name of the tape drive.
+    pub tape_drive: String,
+    /// The list of tapes which were used in this backup job.
+    pub used_tapes_list: Vec<String>,
+    /// The list of snapshots which were backed up.
+    pub snapshot_list: Vec<String>,
+}
+
+/// Template data for the tape-backup-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TapeBackupErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore that was backed up.
+    pub datastore: String,
+    /// The optional job id for this tape backup job.
+    pub job_id: Option<String>,
+    /// The total duration of the backup job in seconds.
+    pub job_duration: u64,
+    /// The tape pool.
+    pub tape_pool: String,
+    /// The name of the tape drive.
+    pub tape_drive: String,
+    /// The list of tapes which were used in this backup job.
+    pub used_tapes_list: Vec<String>,
+    /// The list of snapshots which were backed up.
+    pub snapshot_list: Vec<String>,
+    /// The error that happened during the backup job.
+    pub error: String,
+}
+
+/// Template data for the tape-load template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TapeLoadTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The reason why the tape must be loaded.
+    pub load_reason: Option<String>,
+    /// The tape drive.
+    pub tape_drive: String,
+    /// The type of the drive (changer/drive)
+    pub drive_type: String,
+    /// The drive is a tape changer.
+    pub drive_is_changer: bool,
+    /// The label of the tape.
+    pub tape_label: String,
+}
+
+/// Template data for the verify-ok template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyOkTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+}
+
+/// Template data for the verify-err template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyErrTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The ID of the job.
+    pub job_id: String,
+    /// The list of snapshots that failed to verify.
+    pub failed_snapshot_list: Vec<String>,
+}
+
+/// Template data for the datastore threshold exceeded template.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DatastoreThresholdExceededTemplateData {
+    /// Common properties.
+    #[serde(flatten)]
+    pub common: CommonData,
+    /// The datastore.
+    pub datastore: String,
+    /// The threshold which value was exceeded.
+    pub threshold: String,
+    /// The set threshold value.
+    pub limit: u64,
+    /// The value exceeding the threshold.
+    pub value: u64,
+    /// Whether the values represent traffic (bytes) rather than counts.
+    pub is_traffic: bool,
+}
+
+impl DatastoreThresholdExceededTemplateData {
+    /// Create a new instance.
+    pub fn new(
+        datastore: String,
+        threshold: String,
+        limit: u64,
+        value: u64,
+        is_traffic: bool,
+    ) -> Self {
+        Self {
+            common: CommonData::new(),
+            datastore,
+            threshold,
+            limit,
+            value,
+            is_traffic,
+        }
+    }
+}

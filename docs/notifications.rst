@@ -1,0 +1,420 @@
+.. _notifications:
+
+Notifications
+=============
+
+Overview
+--------
+
+* Proxmox Backup Server emits :ref:`notification_events` in case of noteworthy
+  events in the system. These events are processed based on the global
+  notification settings. Each notification event includes metadata, such as a
+  timestamp, severity level, type, and additional event-specific fields.
+* :ref:`notification_matchers` route a notification event to one or more
+  notification targets. A matcher can have match rules to selectively route
+  based on the metadata of a notification event.
+* :ref:`notification_targets` are a destination to which a notification event
+  is routed to by a matcher. There are multiple types of target, mail-based
+  (Sendmail and SMTP) and Gotify.
+
+Global notification settings can be configured in the GUI under *Configuration →
+Notifications*. The configuration is stored in :ref:`notifications.cfg` and
+:ref:`notifications_priv.cfg` - the latter contains sensitive configuration
+options such as passwords or authentication tokens for notification targets and
+can only be read by ``root``.
+
+.. _notification_targets:
+
+Notification Targets
+--------------------
+
+Proxmox Backup Server offers multiple types of notification targets.
+
+.. _notification_targets_sendmail:
+
+Sendmail
+^^^^^^^^
+The sendmail binary is a program commonly found on Unix-like operating systems
+that handles the sending of email messages. It is a command-line utility that
+allows users and applications to send emails directly from the command line or
+from within scripts.
+
+The sendmail notification target uses the ``sendmail`` binary to send emails to
+a list of configured users or email addresses. If a user is selected as a
+recipient, the email address configured in user's settings will be used. For
+the ``root@pam`` user, this is the email address entered during installation. A
+user's email address can be configured in ``Configuration → Access Control →
+User Management``. If a user has no associated email address, no email will be
+sent.
+
+.. NOTE:: In standard Proxmox Backup Server installations, the ``sendmail``
+   binary is provided by Postfix. It may be necessary to configure Postfix so
+   that it can deliver mails correctly - for example by setting an external
+   mail relay (smart host). In case of failed delivery, check the system logs
+   for messages logged by the Postfix daemon.
+
+See :ref:`notifications.cfg` for all configuration options.
+
+.. _notification_targets_smtp:
+
+SMTP
+^^^^
+SMTP notification targets can send emails directly to an SMTP mail relay. This
+target does not use the system's MTA to deliver emails. Similar to sendmail
+targets, if a user is selected as a recipient, the user's configured email
+address will be used.
+
+.. NOTE:: Unlike sendmail targets, SMTP targets do not have any queuing/retry
+   mechanism in case of a failed mail delivery.
+
+See :ref:`notifications.cfg` for all configuration options.
+
+.. _notification_targets_gotify:
+
+Gotify
+^^^^^^
+`Gotify <http://gotify.net>`_ is an open-source self-hosted notification server
+that allows you to send push notifications to various devices and applications.
+It provides a simple API and web interface, making it easy to integrate with
+different platforms and services.
+
+.. NOTE:: Gotify targets will respect the HTTP proxy settings from
+   Configuration → Other → HTTP proxy
+
+See :ref:`notifications.cfg` for all configuration options.
+
+.. _notification_targets_webhook:
+Webhook
+^^^^^^^
+Webhook notification targets perform HTTP requests to a configurable URL.
+
+The following configuration options are available:
+
+* ``url``: The URL to which to perform the HTTP requests. Supports templating
+  to inject message contents, metadata and secrets.
+* ``method``: HTTP Method to use (POST/PUT/GET)
+* ``header``: Array of HTTP headers that should be set for the request.
+  Supports templating to inject message contents, metadata and secrets.
+* ``body``: HTTP body that should be sent. Supports templating to inject
+  message contents, metadata and secrets.
+* ``secret``: Array of secret key-value pairs. These will be stored in a
+  protected configuration file only readable by root. Secrets can be
+  accessed in body/header/URL templates via the ``secrets`` namespace.
+* ``comment``: Comment for this target.
+
+For configuration options that support templating, the `Handlebars
+<https://handlebarsjs.com>`_ syntax can be used to access the following
+properties:
+
+* ``{{ title }}``: The rendered notification title
+* ``{{ message }}``: The rendered notification body
+* ``{{ severity }}``: The severity of the notification (``info``, ``notice``,
+  ``warning``, ``error``, ``unknown``)
+* ``{{ timestamp }}``: The notification's timestamp as a UNIX epoch (in
+  seconds).
+* ``{{ fields.<name> }}``: Sub-namespace for any metadata fields of the
+  notification. For instance, ``fields.type`` contains the notification
+  type - for all available fields refer to :ref:`notification_events`.
+* ``{{ secrets.<name> }}``: Sub-namespace for secrets. For instance, a secret
+  named ``token`` is accessible via ``secrets.token``.
+
+For convenience, the following helpers are available:
+
+* ``{{ url-encode <value/property> }}``: URL-encode a property/literal.
+* ``{{ escape <value/property> }}``: Escape any control characters that cannot
+  be safely represented as a JSON string.
+* ``{{ json <value/property> }}``: Render a value as JSON. This can be useful
+  to pass a whole sub-namespace (e.g. ``fields``) as a part of a JSON payload
+  (e.g. ``{{ json fields }}``).
+
+
+.. NOTE:: Webhook targets will respect the HTTP proxy settings from
+   Configuration → Other → HTTP proxy
+
+Example - ntfy.sh
+"""""""""""""""""
+
+* Method: ``POST``
+* URL: ``https://ntfy.sh/{{ secrets.channel }}``
+* Headers:
+
+  * ``Markdown``: ``Yes``
+* Body::
+
+    ```
+    {{ message }}
+    ```
+
+* Secrets:
+
+  * ``channel``: ``<your ntfy.sh channel>``
+
+Example - Discord
+"""""""""""""""""
+
+* Method: ``POST``
+* URL: ``https://discord.com/api/webhooks/{{ secrets.token }}``
+* Headers:
+
+  * ``Content-Type``: ``application/json``
+
+* Body::
+
+    {
+      "content": "``` {{ escape message }}```"
+    }
+
+* Secrets:
+
+  * ``token``: ``<token>``
+
+Example - Slack
+"""""""""""""""
+
+* Method: ``POST``
+* URL: ``https://hooks.slack.com/services/{{ secrets.token }}``
+* Headers:
+
+  * ``Content-Type``: ``application/json``
+
+* Body::
+
+    {
+      "text": "``` {{escape message}}```",
+      "type": "mrkdwn"
+    }
+
+* Secrets:
+
+  * ``token``: ``<token>``
+
+.. _notification_matchers:
+
+Notification Matchers
+---------------------
+
+Notification matchers route notifications to notification targets based on
+their matching rules. These rules can match certain properties of a
+notification, such as the timestamp (``match-calendar``), the severity of the
+notification (``match-severity``) or metadata fields (``match-field``). If a
+notification is matched by a matcher, all targets configured for the matcher
+will receive the notification.
+
+An arbitrary number of matchers can be created, each with with their own
+matching rules and targets to notify. Every target is notified at most once for
+every notification, even if the target is used in multiple matchers.
+
+A matcher without rules matches any notification; the configured targets will
+always be notified.
+
+See :ref:`notifications.cfg` for all configuration options.
+
+Calendar Matching Rules
+^^^^^^^^^^^^^^^^^^^^^^^
+A calendar matcher matches a notification's timestamp.
+
+Examples:
+
+* ``match-calendar 8-12``
+* ``match-calendar 8:00-15:30``
+* ``match-calendar mon-fri 9:00-17:00``
+* ``match-calendar sun,tue-wed,fri 9-17``
+
+Field Matching Rules
+^^^^^^^^^^^^^^^^^^^^
+Notifications have a selection of metadata fields that can be matched. When
+using ``exact`` as a matching mode, a ``,`` can be used as a separator. The
+matching rule then matches if the metadata field has **any** of the specified
+values.
+
+Examples:
+
+* ``match-field exact:type=gc`` Only match notifications for garbage collection
+  jobs
+* ``match-field exact:type=prune,verify`` Match prune job and verification job
+  notifications.
+* ``match-field regex:datastore=^backup-.*$`` Match any datastore starting with
+  ``backup``.
+
+If a notification does not have the matched field, the rule will **not** match.
+For instance, a ``match-field regex:datastore=.*`` directive will match any
+notification that has a ``datastore`` metadata field, but will not match if the
+field does not exist.
+
+Severity Matching Rules
+^^^^^^^^^^^^^^^^^^^^^^^
+A notification has a associated severity that can be matched.
+
+Examples:
+
+* ``match-severity error``: Only match errors
+* ``match-severity warning,error``: Match warnings and error
+
+The following severities are in use:
+``info``, ``notice``, ``warning``, ``error``, ``unknown``.
+
+.. _notification_events:
+
+Notification Events
+-------------------
+
+The following table contains a list of all notification events in Proxmox
+Backup Server, their type, severity and additional metadata fields. ``type`` as
+well as any other metadata field may be used in ``match-field`` match rules.
+
+================================ ==================== ========== ==============================================================
+Event                            ``type``             Severity   Metadata fields (in addition to ``type``)
+================================ ==================== ========== ==============================================================
+ACME certificate renewal failed  ``acme``             ``error``  ``hostname``
+Garbage collection failure       ``gc``               ``error``  ``datastore``, ``hostname``
+Garbage collection success       ``gc``               ``info``   ``datastore``, ``hostname``
+Package updates available        ``package-updates``  ``info``   ``hostname``
+Prune job failure                ``prune``            ``error``  ``datastore``, ``hostname``, ``job-id``
+Prune job success                ``prune``            ``info``   ``datastore``, ``hostname``, ``job-id``
+Remote sync failure              ``sync``             ``error``  ``datastore``, ``hostname``, ``job-id``
+Remote sync success              ``sync``             ``info``   ``datastore``, ``hostname``, ``job-id``
+Tape backup job failure          ``tape-backup``      ``error``  ``datastore``, ``hostname``, ``media-pool``, ``job-id``
+Tape backup job success          ``tape-backup``      ``info``   ``datastore``, ``hostname``, ``media-pool``, ``job-id``
+Tape loading request             ``tape-load``        ``notice`` ``hostname``
+Verification job failure         ``verification``     ``error``  ``datastore``, ``hostname``, ``job-id``
+Verification job success         ``verification``     ``info``   ``datastore``, ``hostname``, ``job-id``
+================================ ==================== ========== ==============================================================
+
+The following table contains a description of all use metadata fields. All of
+these can be used in ``match-field`` match rules.
+
+==================== ===================================
+Metadata field       Description
+==================== ===================================
+``datastore``        The name of the datastore
+``hostname``         The hostname of the backup server
+``job-id``           Job ID
+``media-pool``       The name of the tape media pool
+``type``             Notification event type
+==================== ===================================
+
+.. NOTE:: The daily task checking for any available system updates only sends
+   notifications if the node has an active subscription.
+
+System Mail Forwarding
+----------------------
+Certain local system daemons, such as ``smartd``, send notification emails to
+the local ``root`` user. These mails are converted into notification events
+with the type ``system-mail`` and with a severity of ``unknown``.
+
+When the email is forwarded to a sendmail target, the mail's content and
+headers are forwarded as-is. For all other targets, the system tries to extract
+both a subject line and the main text body from the email content. In instances
+where emails solely consist of HTML content, they will be transformed into
+plain text format during this process.
+
+Permissions
+-----------
+In order to modify/view the configuration for notification targets, the
+``Sys.Modify/Sys.Audit`` permissions are required for the
+``/system/notifications`` ACL node.
+
+.. _notification_mode:
+
+Notification Mode
+-----------------
+Datastores and tape backup/restore job configuration have a
+``notification-mode`` option which can have one of two values:
+
+* Send notifications based on the global notification settings (``notification-system``).
+
+* Send notification emails via the system's ``sendmail`` command
+  (``legacy-sendmail``). Any targets or matchers from the global notification
+  settings are ignored. This mode is equivalent to the notification behavior
+  for Proxmox Backup Server versions before 3.2. It might be removed in a
+  later release of Proxmox Backup Server.
+
+
+Settings for ``legacy-sendmail`` notification mode
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If ``notification-mode`` is set to ``legacy-sendmail``,  Proxmox Backup Server
+will send notification emails via the system's ``sendmail`` command to the
+email address configured for the user set in the ``notify-user`` option
+(falling back to ``root@pam`` if not set).
+
+For datastores, you can also change the level of notifications received per
+task type via the ``notify`` option.
+
+* Always: send a notification for any scheduled task, independent of the
+  outcome
+
+* Errors: send a notification for any scheduled task that results in an error
+
+* Never: do not send any notification at all
+
+The ``notify-user`` and ``notify`` options are ignored when using the global
+notification settings (``notification-mode`` is set to
+``notification-system``).
+
+Overriding Notification Templates
+---------------------------------
+
+Proxmox Backup Server uses Handlebars templates to render notifications. The
+original templates provided by Proxmox Backup Server are stored in
+``/usr/share/proxmox-backup/templates/default/``.
+
+Notification templates can be overridden by providing a custom template file in
+the override directory at
+``/etc/proxmox-backup/notification-templates/default/``. When rendering a
+notification of a given type, Proxmox Backup Server will first attempt to load
+a template from the override directory. If this one does not exist or fails to
+render, the original template will be used.
+
+The template files follow the naming convention of
+``<type>-<body|subject>.txt.hbs``. For instance, the file
+``gc-err-body.txt.hbs`` contains the template for rendering notifications for
+garbage collection errors, while ``package-updates-subject.txt.hbs`` is used to
+render the subject line of notifications for available package updates.
+
+.. _s3_notification_thresholds:
+
+Notification Thresholds and Reset Schedule (S3 Datastores Only)
+---------------------------------------------------------------
+
+Datastores of type S3 keep track of the number of requests being send to the
+corresponding S3 endpoint and the amount of data being send. Proxmox Backup
+Server allows to configure threshold for these request and traffic counters to
+send out notifications if one of the set threshold values is exceeded.
+
+The notification threshold value can be set individually by request method or
+traffic volume. Notifications will be send out only once per threshold when the
+threshold has been exceeded. A counter reset is required to bring it below the
+threshold again in order to get further notifications. Therefore, it is possible
+to define a threshold reset schedule so request and traffic counters get
+periodically reset.
+
+Per datastore notification thresholds and their reset schedule are configurable
+in the :ref:`Datastore Options <datastore_options>` for S3 backed datastores.
+
+The following counters thresholds are available for configuration:
+
+==================== ==========================================================
+Counter Threshold    Description and Usage
+==================== ==========================================================
+``s3-get``           Number of ``GET`` requests: Mainly used for download of
+                     data and metadata among the following operations: restore,
+                     verification, S3 refresh, garbage collection.
+``s3-put``           Number of ``PUT`` requests: Mainly used for upload of data
+                     and metadata among the following operations: backup, syncs,
+                     metadata changes, content moves.
+``s3-post``          Number of ``POST`` requests: Mainly used for modification
+                     of data and metadata among the following operations: bulk
+                     deletion during garbage collection, content moves.
+``s3-head``          Number of ``HEAD`` requests: Mainly used to check for
+                     access and existence among which the following operations:
+                     checking bucket access, fetching of metadata.
+``s3-delete``        Number of ``DELETE`` requests: Mainly used for deleting
+                     single objects by the following operations: garbage
+                     collection, content moves.
+``s3-upload``        Amount of bytes uploaded to the S3 endpoint, independent of
+                     request method.
+``s3-download``      Amount of bytes downloaded from the S3 endpoint,
+                     independent of request method.
+==================== ==========================================================
+

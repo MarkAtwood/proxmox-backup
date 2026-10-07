@@ -1,0 +1,190 @@
+use std::future::Future;
+use std::pin::{Pin, pin};
+
+use anyhow::{Error, bail};
+use hyper::StatusCode;
+use hyper::http::Response;
+use hyper_util::server::graceful::GracefulShutdown;
+use tokio::net::TcpListener;
+use tracing::level_filters::LevelFilter;
+
+use proxmox_http::Body;
+use proxmox_lang::try_block;
+use proxmox_rest_server::{ApiConfig, RestServer};
+use proxmox_router::RpcEnvironmentType;
+use proxmox_sys::fs::CreateOptions;
+
+use pbs_buildcfg::configdir;
+use proxmox_backup::auth_helpers::*;
+use proxmox_backup::config;
+use proxmox_backup::server::auth::check_pbs_auth;
+
+fn main() {
+    pbs_tools::setup_libc_malloc_opts();
+
+    proxmox_backup::tools::setup_safe_path_env();
+
+    if let Err(err) = proxmox_async::runtime::main(run()) {
+        eprintln!("Error: {err}");
+        std::process::exit(-1);
+    }
+}
+
+fn get_index() -> Pin<Box<dyn Future<Output = Response<Body>> + Send>> {
+    Box::pin(async move {
+        let index = "<center><h1>Proxmox Backup API Server</h1></center>";
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/html")
+            .body(index.to_string().into())
+            .unwrap()
+    })
+}
+
+async fn run() -> Result<(), Error> {
+    proxmox_log::Logger::from_env("PBS_LOG", LevelFilter::INFO)
+        .journald_on_no_workertask()
+        .tasklog_pbs()
+        .init()?;
+
+    let backup_user = pbs_config::backup_user()?;
+    proxmox_product_config::init(backup_user.clone(), pbs_config::priv_user()?);
+
+    config::create_configdir()?;
+
+    config::update_self_signed_cert(false)?;
+    config::update_default_realms()?;
+
+    proxmox_backup::server::create_run_dir()?;
+    proxmox_backup::server::create_state_dir()?;
+    proxmox_backup::server::create_active_operations_dir()?;
+    proxmox_backup::server::jobstate::create_jobstate_dir()?;
+    proxmox_backup::server::notifications::create_spool_dir()?;
+    proxmox_backup::tape::create_tape_status_dir()?;
+    proxmox_backup::tape::create_drive_state_dir()?;
+    proxmox_backup::tape::create_changer_state_dir()?;
+    proxmox_backup::tape::create_drive_lock_dir()?;
+
+    if let Err(err) = generate_auth_key() {
+        bail!("unable to generate auth key - {}", err);
+    }
+    let _ = private_auth_key(); // load with lazy_static
+
+    if let Err(err) = generate_csrf_key() {
+        bail!("unable to generate csrf key - {}", err);
+    }
+    let _ = csrf_secret(); // load with lazy_static
+
+    proxmox_backup::auth_helpers::setup_auth_context(true);
+    proxmox_backup::server::notifications::init()?;
+    let mut command_sock = proxmox_daemon::command_socket::CommandSocket::new(backup_user.gid);
+
+    proxmox_acme_api::init(configdir!("/acme"), true)?;
+
+    let dir_opts = CreateOptions::new()
+        .owner(backup_user.uid)
+        .group(backup_user.gid);
+    let file_opts = CreateOptions::new()
+        .owner(backup_user.uid)
+        .group(backup_user.gid);
+
+    let config = ApiConfig::new(pbs_buildcfg::JS_DIR, RpcEnvironmentType::PRIVILEGED)
+        .index_handler_func(|_, _| get_index())
+        .auth_handler_func(|h, m| Box::pin(check_pbs_auth(h, m)))
+        .auth_cookie_name(proxmox_backup::auth_helpers::get_auth_cookie_name())
+        .default_api2_handler(&proxmox_backup::api2::ROUTER)
+        .enable_access_log(
+            pbs_buildcfg::API_ACCESS_LOG_FN,
+            Some(dir_opts),
+            Some(file_opts),
+            &mut command_sock,
+        )?
+        .enable_auth_log(
+            pbs_buildcfg::API_AUTH_LOG_FN,
+            Some(dir_opts),
+            Some(file_opts),
+            &mut command_sock,
+        )?;
+
+    let rest_server = RestServer::new(config);
+    proxmox_rest_server::init_worker_tasks(
+        pbs_buildcfg::PROXMOX_BACKUP_LOG_DIR_M!().into(),
+        file_opts,
+    )?;
+
+    // http server future:
+    let server = proxmox_daemon::server::create_daemon(
+        ([127, 0, 0, 1], 82).into(),
+        move |listener: TcpListener| {
+            Ok(async move {
+                proxmox_systemd::notify::SystemdNotify::Ready.notify()?;
+                let graceful = GracefulShutdown::new();
+                loop {
+                    tokio::select! {
+                        incoming = listener.accept() => {
+                            let (conn, _) = incoming?;
+                            let api_service = rest_server.api_service(&conn)?;
+                            let watcher = graceful.watcher();
+                            tokio::spawn(async move { api_service.serve(conn, Some(watcher)).await });
+                        },
+                        _shutdown = proxmox_daemon::shutdown_future() => {
+                            break;
+                        },
+                    }
+                }
+                log::info!("shutting down..");
+                graceful.shutdown().await;
+                Ok(())
+            })
+        },
+        Some(pbs_buildcfg::PROXMOX_BACKUP_API_PID_FN),
+    );
+
+    proxmox_rest_server::write_pid(pbs_buildcfg::PROXMOX_BACKUP_API_PID_FN)?;
+
+    let init_result: Result<(), Error> = try_block!({
+        proxmox_rest_server::register_task_control_commands(&mut command_sock)?;
+        command_sock.spawn(proxmox_rest_server::last_worker_future())?;
+        proxmox_daemon::catch_shutdown_signal(proxmox_rest_server::last_worker_future())?;
+        proxmox_daemon::catch_reload_signal(proxmox_rest_server::last_worker_future())?;
+        Ok(())
+    });
+
+    if let Err(err) = init_result {
+        bail!("unable to start daemon - {}", err);
+    }
+
+    // stop gap for https://github.com/tokio-rs/tokio/issues/4730 where the thread holding the
+    // IO-driver may block progress completely if it starts polling its own tasks (blocks).
+    // So, trigger a notify to parked threads, as we're immediately ready the woken up thread will
+    // acquire the IO driver, if blocked, before going to sleep, which allows progress again
+    // TODO: remove once tokio solves this at their level (see proposals in linked comments)
+    let rt_handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        loop {
+            rt_handle.spawn(std::future::ready(()));
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    });
+
+    start_notification_worker();
+
+    server.await?;
+    log::info!("server shutting down, waiting for active workers to complete");
+    proxmox_rest_server::last_worker_future().await;
+
+    log::info!("done - exit server");
+
+    Ok(())
+}
+
+fn start_notification_worker() {
+    let future = proxmox_backup::server::notifications::notification_worker();
+    let abort_future = proxmox_daemon::shutdown_future();
+    tokio::spawn(async move {
+        let future = pin!(future);
+        let abort_future = pin!(abort_future);
+        futures::future::select(future, abort_future).await;
+    });
+}

@@ -1,0 +1,23 @@
+Datastore:            {{datastore}}
+Task ID:              {{upid}}
+Index file count:     {{index-file-count}}
+
+Removed garbage:      {{human-bytes removed-bytes}}
+Removed chunks:       {{removed-chunks}}
+Removed bad chunks:   {{removed-bad}}
+
+Leftover bad chunks:  {{still-bad}}
+Pending removals:     {{human-bytes pending-bytes}} (in {{pending-chunks}} chunks)
+
+Original Data usage:  {{human-bytes index-data-bytes}}
+On-Disk usage:        {{human-bytes disk-bytes}} ({{relative-percentage disk-bytes index-data-bytes}})
+On-Disk chunks:       {{disk-chunks}}
+
+Deduplication Factor: {{deduplication-factor}}
+
+Garbage collection successful.
+
+
+Please visit the web interface for further details:
+
+<{{base-url}}/#DataStore-{{datastore}}>
